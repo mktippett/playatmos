@@ -80,6 +80,13 @@ static CGImageRef imageFromRect(const AVSubtitleRect *r) {
 }
 
 // "eng", "ger", "en-US" ... -> "en", "de", "en"; nil for missing/undetermined.
+// Container metadata strings: UTF-8 per spec, but older files (AVI) may carry Latin-1,
+// where @(s) would give nil. Latin-1 decoding never fails.
+static NSString *tagString(const char *s) {
+    if (!s) return nil;
+    return [NSString stringWithUTF8String:s] ?: [NSString stringWithCString:s encoding:NSISOLatin1StringEncoding];
+}
+
 static NSString *langCode(NSString *tag) {
     if (!tag.length || [tag isEqualToString:@"und"]) return nil;
     NSString *c = [NSLocale localeWithLocaleIdentifier:tag].languageCode;
@@ -137,14 +144,15 @@ static int interruptCB(void *opaque) {
             t.forced = (st->disposition & AV_DISPOSITION_FORCED) != 0;
             AVDictionaryEntry *lang = av_dict_get(st->metadata, "language", NULL, 0);
             AVDictionaryEntry *title = av_dict_get(st->metadata, "title", NULL, 0);
-            t.language = lang ? langCode(@(lang->value)) : nil;
+            t.language = lang ? langCode(tagString(lang->value)) : nil;
             t.sdh = (st->disposition & AV_DISPOSITION_HEARING_IMPAIRED) || (title && strstr(title->value, "SDH"));
             if (title && strcasestr(title->value, "forced")) t.forced = YES;
             NSMutableArray *parts = [NSMutableArray array];
-            NSString *code = lang ? @(lang->value) : nil;
+            NSString *code = lang ? tagString(lang->value) : nil;
             NSString *name = code ? [NSLocale.currentLocale localizedStringForLanguageCode:code] : nil;
             [parts addObject:name ?: code ?: [NSString stringWithFormat:@"Subtitle %d", ordinal]];
-            if (title && title->value[0] && ![@(title->value) isEqualToString:name]) [parts addObject:@(title->value)];
+            NSString *titleStr = title && title->value[0] ? tagString(title->value) : nil;
+            if (titleStr && ![titleStr isEqualToString:name]) [parts addObject:titleStr];
             else if (t.forced) [parts addObject:@"Forced"];
             if (st->disposition & AV_DISPOSITION_HEARING_IMPAIRED && !(title && strstr(title->value, "SDH"))) [parts addObject:@"SDH"];
             if (t.bitmap) [parts addObject:@"image"];
@@ -220,7 +228,7 @@ static NSString *normName(NSString *s) {
                 AVDictionaryEntry *lang = av_dict_get(x->streams[i]->metadata, "language", NULL, 0);
                 SubtitleTrack *t = [SubtitleTrack new];
                 t.stream = -1; t.externalPath = path; t.externalStream = (int)i; t.bitmap = YES;
-                t.language = lang ? langCode(@(lang->value)) : nameLang;
+                t.language = lang ? langCode(tagString(lang->value)) : nameLang;
                 NSString *name = t.language ? [NSLocale.currentLocale localizedStringForLanguageCode:t.language] : nil;
                 // Number the entries: one .idx often holds several tracks of the same language.
                 t.label = [NSString stringWithFormat:@"%@ · image %u (external %@)", name ?: @"Subtitle", i + 1, f];

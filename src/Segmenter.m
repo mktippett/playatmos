@@ -24,6 +24,13 @@ static void pl_push(PktList *l, AVPacket *pk) {
     l->p[l->n++] = pk;
 }
 static void pl_free(PktList *l) { for (int i = 0; i < l->n; i++) av_packet_free(&l->p[i]); free(l->p); *l = (PktList){0}; }
+// Container metadata strings: UTF-8 per spec, but older files (AVI) may carry Latin-1,
+// where @(s) would give nil. Latin-1 decoding never fails.
+static NSString *tagString(const char *s) {
+    if (!s) return nil;
+    return [NSString stringWithUTF8String:s] ?: [NSString stringWithCString:s encoding:NSISOLatin1StringEncoding];
+}
+
 static int cmp_i64(const void *a, const void *b) { int64_t x = *(const int64_t *)a, y = *(const int64_t *)b; return (x > y) - (x < y); }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +216,7 @@ static int audioScore(const AVStream *s) {
         _a.tb = st->time_base;
         _a.frameSize = p->frame_size;
         AVDictionaryEntry *lang = av_dict_get(st->metadata, "language", NULL, 0);
-        if (lang && lang->value[0] && strcmp(lang->value, "und")) _audioLanguage = @(lang->value);
+        if (lang && lang->value[0] && strcmp(lang->value, "und")) _audioLanguage = tagString(lang->value);
         _atmosPassthrough = isAtmosEAC3(p);
         _transcode = p->codec_id != AV_CODEC_ID_EAC3 && p->codec_id != AV_CODEC_ID_AC3 && p->codec_id != AV_CODEC_ID_AAC;
         const char *prof = avcodec_profile_name(p->codec_id, p->profile);
@@ -1058,7 +1065,7 @@ static BOOL patchDec3(NSMutableData *buf, NSUInteger o, NSUInteger end) {
         uint32_t sz = rd32(moov + o);
         if (sz < 8) break;
         if (memcmp(moov + o + 4, "trak", 4) == 0) {
-            const uint8_t *trak = moov + o + 8; size_t tl = sz - 8, bl;
+            const uint8_t *trak = moov + o + 8; size_t tl = sz - 8, bl = 0;
             const uint8_t *tkhd = findBox(trak, tl, "tkhd", &bl);
             const uint8_t *mdia = findBox(trak, tl, "mdia", &bl); size_t ml = bl;
             const uint8_t *mdhd = mdia ? findBox(mdia + 8, ml - 8, "mdhd", &bl) : NULL;

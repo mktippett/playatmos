@@ -21,6 +21,10 @@
 
 - (BOOL)start:(NSError **)error {
     _fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (_fd < 0) {
+        if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
+        return NO;
+    }
     int one = 1; setsockopt(_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     struct sockaddr_in a = { .sin_len = sizeof a, .sin_family = AF_INET, .sin_port = 0, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
     if (bind(_fd, (struct sockaddr *)&a, sizeof a) < 0 || listen(_fd, 16) < 0) {
