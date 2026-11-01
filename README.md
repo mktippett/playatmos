@@ -158,8 +158,8 @@ per-channel RMS:
   (`open --env PLAYATMOS_VOLUME=0.03 -a build/PlayAtmos.app file.mkv`, then `build/capture 8`)
 - `probe/`: the investigation programs behind the table above
 
-The code is Objective-C built with plain clang (no Xcode project), because the Swift
-toolchain in the development machine's Command Line Tools was broken.
+The code is Objective-C built with plain clang (no Xcode project). Most of it works
+directly with FFmpeg's C API, which is simplest from C/Objective-C.
 
 ## License
 
