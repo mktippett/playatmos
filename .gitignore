@@ -1,0 +1,32 @@
+# Local Claude Code instructions — never public
+CLAUDE.md
+
+# Build output (regenerate with ./build.sh)
+build/
+*.dSYM/
+*.o
+
+# Test media — large and third-party; keep local
+*.mkv
+*.mka
+*.mp4
+*.m4v
+*.mov
+*.m4s
+*.m3u8
+
+# Large data files
+*.nc
+*.zarr
+*.h5
+*.grib
+*.grb
+
+# Python / Jupyter leftovers
+__pycache__/
+.ipynb_checkpoints/
+
+# Secrets and OS clutter
+.env
+.env.*
+.DS_Store

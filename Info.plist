@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>PlayAtmos</string>
+  <key>CFBundleDisplayName</key><string>PlayAtmos</string>
+  <key>CFBundleIdentifier</key><string>local.playatmos</string>
+  <key>CFBundleExecutable</key><string>PlayAtmos</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.1</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSPrincipalClass</key><string>NSApplication</string>
+  <!-- AVPlayer fetches the HLS stream from our own 127.0.0.1 server. -->
+  <key>NSAppTransportSecurity</key>
+  <dict><key>NSAllowsLocalNetworking</key><true/></dict>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Matroska Video</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>CFBundleTypeExtensions</key><array><string>mkv</string><string>mka</string><string>webm</string></array>
+      <key>LSItemContentTypes</key><array><string>org.matroska.mkv</string><string>public.movie</string></array>
+    </dict>
+  </array>
+</dict>
+</plist>
