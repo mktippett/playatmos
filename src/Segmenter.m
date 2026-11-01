@@ -3,6 +3,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
 #include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -86,9 +87,19 @@ typedef struct {
     // the opening.  Silent frames (one encoded frame, repeated) cover the gap.
     AVPacket *_silence;
     int64_t _firstAudioPts, _silenceDur;   // audio time base
+    // Fallback for video AVFoundation can't decode (VC-1, MPEG-4 Part 2/XviD, MPEG-2...):
+    // decode with libavcodec and re-encode each segment to H.264 with VideoToolbox.
+    BOOL _vtranscode;
+    AVCodecContext *_vdec;
+    struct SwsContext *_sws;
+    int64_t _vbitrate;
+    BOOL _raCheck;     // verify keyframes in the bitstream (see isRandomAccess:)
+    BOOL _vCadence;    // video packets lack display timestamps: stamp frames by frame rate
 }
 
 static void *const kSynthetic = (void *)&kSynthetic;   // AVPacket.opaque tag for filler frames
+static void *const kSegStart = (void *)&kSegStart;     // first keyframe of a segment (converted video)
+static void *const kSegEnd = (void *)&kSegEnd;         // first keyframe of the next segment
 static int realCount(const PktList *l) { int n = 0; for (int i = 0; i < l->n; i++) n += l->p[i]->opaque != kSynthetic; return n; }
 
 static NSError *mkerr(NSString *msg) {
@@ -130,6 +141,8 @@ static int audioScore(const AVStream *s) {
 }
 
 - (void)dealloc {
+    if (_vdec) avcodec_free_context(&_vdec);
+    if (_sws) sws_freeContext(_sws);
     if (_silence) av_packet_free(&_silence);
     if (_dec) avcodec_free_context(&_dec);
     av_channel_layout_uninit(&_outLayout);
@@ -157,6 +170,15 @@ static int audioScore(const AVStream *s) {
         if (c == AV_CODEC_ID_H264 || c == AV_CODEC_ID_HEVC || c == AV_CODEC_ID_AV1) { _v.st = (int)i; break; }
         if (_v.st < 0) _videoSummary = [NSString stringWithFormat:@"%s video is not supported by AVFoundation", avcodec_get_name(c)];
     }
+    if (_v.st < 0) {
+        for (unsigned i = 0; i < _fmt->nb_streams; i++) {
+            AVStream *st = _fmt->streams[i];
+            if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO || (st->disposition & AV_DISPOSITION_ATTACHED_PIC)) continue;
+            if (!avcodec_find_decoder(st->codecpar->codec_id)) continue;
+            _v.st = (int)i; _vtranscode = YES;
+            break;
+        }
+    }
     _idxSt = -1;
     for (unsigned i = 0; i < _fmt->nb_streams && _idxSt < 0; i++)
         if (_fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && !(_fmt->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC))
@@ -175,6 +197,11 @@ static int audioScore(const AVStream *s) {
         AVCodecParameters *p = _fmt->streams[_v.st]->codecpar;
         _v.tb = _fmt->streams[_v.st]->time_base;
         _videoSummary = [NSString stringWithFormat:@"%s %dx%d", avcodec_get_name(p->codec_id), p->width, p->height];
+        if (_vtranscode) {
+            NSString *e = [self setupVideoTranscode];
+            if (e) return e;
+            _videoSummary = [_videoSummary stringByAppendingFormat:@" → H.264 %.1f Mb/s (hardware re-encode)", _vbitrate / 1e6];
+        }
     }
     if (_a.st >= 0) {
         AVStream *st = _fmt->streams[_a.st];
@@ -361,6 +388,8 @@ static int64_t pktTime(const AVPacket *p) { return p->pts != AV_NOPTS_VALUE ? p-
         avformat_seek_file(_fmt, seekSt, INT64_MIN, INT64_MIN, INT64_MIN, 0);
 
     int vState = _v.st >= 0 ? 0 : 2;   // 0 waiting for keyframe, 1 collecting, 2 done
+    int vExtra = 0;
+    BOOL tagNext = NO;   // the next pushed video packet starts the following segment
     BOOL aDone = _a.st < 0;
     AVPacket *pk = av_packet_alloc();
     for (;;) {
@@ -370,10 +399,21 @@ static int64_t pktTime(const AVPacket *p) { return p->pts != AV_NOPTS_VALUE ? p-
         if (t == AV_NOPTS_VALUE) { av_packet_unref(pk); continue; }
         if (pk->stream_index == _v.st && vState != 2) {
             int64_t us = av_rescale_q(t, _v.tb, AV_TIME_BASE_Q);
-            BOOL key = (pk->flags & AV_PKT_FLAG_KEY) != 0;
+            BOOL key = [self isRandomAccess:pk];
             if (vState == 0 && key && us >= s0) vState = 1;
-            if (vState == 1 && key && us >= s1 && vl->n > 0) { *vNext = t; vState = 2; }
-            if (vState == 1) { pl_push(vl, av_packet_clone(pk)); }
+            if (vState == 1 && key && us >= s1 && vl->n > 0 && *vNext == AV_NOPTS_VALUE) {
+                *vNext = t;
+                tagNext = YES;
+                if (_vtranscode) vExtra = 16; else vState = 2;
+            }
+            if (vState == 1) {
+                AVPacket *q = av_packet_clone(pk);
+                if (vl->n == 0) q->opaque = kSegStart;
+                else if (tagNext) q->opaque = kSegEnd;   // tag exactly the boundary packet (flags may be missing)
+                tagNext = NO;
+                pl_push(vl, q);
+                if (*vNext != AV_NOPTS_VALUE && --vExtra <= 0) vState = 2;
+            }
         } else if (pk->stream_index == _a.st && !aDone) {
             int64_t us = av_rescale_q(t, _a.tb, AV_TIME_BASE_Q);
             if (us >= a1) { *aNext = t; aDone = YES; }
@@ -475,9 +515,10 @@ static void buildMatrix(const AVChannelLayout *in, const AVChannelLayout *out, d
     int64_t n1 = k + 1 < _nseg ? av_rescale_rnd(_starts[k + 1], sr, AV_TIME_BASE, AV_ROUND_UP) : INT64_MAX;
     *firstSample = n0;
     const int nch = _outLayout.nb_channels;
-    // Encoder input slot order.  Measured with per-channel tones through
-    // AVPlayer: for 6-channel ALAC Apple assigns slots as C, L, R, LFE, Ls, Rs.
-    static const int map51[6] = { 2, 0, 1, 3, 4, 5 };   // slot -> index in FL FR FC LFE BL BR
+    // Channels go to the ALAC encoder in FFmpeg's native 5.1 order (FL FR FC LFE BL BR);
+    // the encoder and Apple's decoder handle ALAC's own ordering.  (Verified against
+    // FFmpeg's decode of the source; an earlier reorder here compensated for a test
+    // file whose front channels had been rotated by FFmpeg's encoder.)
     SwrContext *swr = NULL;
     swr_alloc_set_opts2(&swr, &_outLayout, AV_SAMPLE_FMT_S32P, (int)sr, &_dec->ch_layout, _dec->sample_fmt, _dec->sample_rate, 0, NULL);
     if (swr && _dec->ch_layout.nb_channels > 2 && _dec->ch_layout.order != AV_CHANNEL_ORDER_UNSPEC) {
@@ -524,7 +565,7 @@ static void buildMatrix(const AVChannelLayout *in, const AVChannelLayout *out, d
                     have++;
                 }
                 if (have == cap) { cap = cap ? cap * 2 : 1 << 16; for (int c = 0; c < nch; c++) pcm[c] = realloc(pcm[c], cap * 4); }
-                for (int c = 0; c < nch; c++) pcm[c][have] = tmp[nch == 6 ? map51[c] : c][j];
+                for (int c = 0; c < nch; c++) pcm[c][have] = tmp[c][j];
                 have++;
             }
             av_frame_unref(fr);
@@ -561,6 +602,214 @@ static void buildMatrix(const AVChannelLayout *in, const AVChannelLayout *out, d
     free(pcm);
 }
 
+// --- Video conversion fallback -------------------------------------------------
+// Container keyframe flags can't be trusted for these codecs (e.g. VC-1 Blu-ray
+// remuxes flag every frame).  A converted segment is decoded from scratch, so it
+// must start where decoding can really start:
+//   VC-1      entry-point (0x0E) or sequence (0x0F) header
+//   MPEG-1/2  sequence (0xB3) or GOP (0xB8) header
+//   MPEG-4 Pt2 first VOP (0xB6) is an I-VOP (vop_coding_type == 0)
+static BOOL bitstreamRandomAccess(enum AVCodecID c, const uint8_t *d, int n) {
+    int lim = MIN(n - 4, 1024);
+    for (int i = 0; i < lim; i++) {
+        if (d[i] || d[i + 1] || d[i + 2] != 1) continue;
+        uint8_t code = d[i + 3];
+        switch (c) {
+            case AV_CODEC_ID_VC1:
+                if (code == 0x0E || code == 0x0F) return YES;
+                if (code == 0x0D) return NO;               // frame start without entry point
+                break;
+            case AV_CODEC_ID_MPEG1VIDEO: case AV_CODEC_ID_MPEG2VIDEO:
+                if (code == 0xB3 || code == 0xB8) return YES;
+                if (code == 0x00) return NO;               // picture start
+                break;
+            case AV_CODEC_ID_MPEG4:
+                if (code == 0xB6) return i + 4 < n && (d[i + 4] >> 6) == 0;
+                break;
+            default: return YES;
+        }
+    }
+    return NO;
+}
+
+- (BOOL)isRandomAccess:(const AVPacket *)pk {
+    // When the bitstream carries entry markers, it alone decides: container flags
+    // are unreliable both ways (all frames flagged, or flags lost after a seek).
+    if (_raCheck) return bitstreamRandomAccess(_fmt->streams[_v.st]->codecpar->codec_id, pk->data, pk->size);
+    return (pk->flags & AV_PKT_FLAG_KEY) != 0;
+}
+
+// VideoToolbox (via libavcodec) emits Annex-B (start codes); MP4 samples need
+// 4-byte length prefixes.  SPS/PPS/AUD are dropped: they live in avcC.
+static AVPacket *annexBToAVCC(const AVPacket *in) {
+    const uint8_t *b = in->data; int n = in->size;
+    NSMutableData *o = [NSMutableData data];
+    int i = 0;
+    while (i + 3 <= n) {
+        int sc = (b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1) ? 3 : (i + 4 <= n && !b[i] && !b[i + 1] && !b[i + 2] && b[i + 3] == 1) ? 4 : 0;
+        if (!sc) { i++; continue; }
+        int start = i + sc, j = start;
+        while (j + 3 <= n && !(b[j] == 0 && b[j + 1] == 0 && (b[j + 2] == 1 || (j + 3 < n && b[j + 2] == 0 && b[j + 3] == 1)))) j++;
+        if (j + 3 > n) j = n;
+        int len = j - start;
+        while (len > 0 && b[start + len - 1] == 0) len--;   // trailing zero bytes before next start code
+        if (len > 0) {
+            int type = b[start] & 0x1f;
+            if (type != 7 && type != 8 && type != 9) {
+                uint32_t be = CFSwapInt32HostToBig((uint32_t)len);
+                [o appendBytes:&be length:4];
+                [o appendBytes:b + start length:len];
+            }
+        }
+        i = j;
+    }
+    AVPacket *q = av_packet_alloc();
+    av_new_packet(q, (int)o.length);
+    memcpy(q->data, o.bytes, o.length);
+    av_packet_copy_props(q, in);
+    return q;
+}
+
+- (NSString *)setupVideoTranscode {
+    AVStream *st = _fmt->streams[_v.st];
+    const AVCodec *dc = avcodec_find_decoder(st->codecpar->codec_id);
+    _vdec = avcodec_alloc_context3(dc);
+    avcodec_parameters_to_context(_vdec, st->codecpar);
+    _vdec->pkt_timebase = st->time_base;
+    _vdec->thread_count = 0;   // auto
+    _vdec->flags |= AV_CODEC_FLAG_COPY_OPAQUE;   // packet tags -> frames (segment boundaries)
+    if (avcodec_open2(_vdec, dc, NULL) < 0) return @"Could not open the video decoder.";
+    // ~0.25 bits per pixel per frame: about 12 Mb/s for 1080p24, 3 Mb/s for DVD.
+    double fps = av_q2d(st->avg_frame_rate);
+    if (!(fps > 1 && fps < 121)) fps = 25;
+    _vbitrate = (int64_t)(st->codecpar->width * st->codecpar->height * fps * 0.25);
+    _vbitrate = MAX(2000000, MIN(25000000, _vbitrate));
+    enum AVCodecID cid = st->codecpar->codec_id;
+    if (cid == AV_CODEC_ID_VC1 || cid == AV_CODEC_ID_MPEG1VIDEO || cid == AV_CODEC_ID_MPEG2VIDEO || cid == AV_CODEC_ID_MPEG4) {
+        avformat_seek_file(_fmt, -1, INT64_MIN, INT64_MIN, INT64_MIN, 0);
+        AVPacket *pk = av_packet_alloc();
+        int seen = 0, ra = 0, flagged = 0, nopts = 0;
+        while (seen < 200 && av_read_frame(_fmt, pk) >= 0) {
+            if (pk->stream_index == _v.st) {
+                seen++;
+                nopts += pk->pts == AV_NOPTS_VALUE;
+                flagged += (pk->flags & AV_PKT_FLAG_KEY) != 0;
+                ra += bitstreamRandomAccess(cid, pk->data, pk->size);
+            }
+            av_packet_unref(pk);
+        }
+        av_packet_free(&pk);
+        _raCheck = ra > 0;   // no markers at all: fall back to the container's flags
+        AVRational fr = st->avg_frame_rate.num > 0 ? st->avg_frame_rate : st->r_frame_rate;
+        _vCadence = seen > 0 && nopts * 2 > seen && fr.num > 0 && fr.den > 0;
+        (void)flagged;
+    }
+    AVCodecContext *probe = [self newVideoEncoder];
+    if (!probe) return @"The hardware H.264 encoder is not available.";
+    avcodec_free_context(&probe);
+    return nil;
+}
+
+- (AVCodecContext *)newVideoEncoder {
+    const AVCodec *ec = avcodec_find_encoder_by_name("h264_videotoolbox");
+    if (!ec) return NULL;
+    AVStream *st = _fmt->streams[_v.st];
+    AVCodecParameters *p = st->codecpar;
+    AVCodecContext *e = avcodec_alloc_context3(ec);
+    e->width = p->width & ~1; e->height = p->height & ~1;
+    e->pix_fmt = AV_PIX_FMT_YUV420P;
+    e->time_base = st->time_base;
+    if (st->avg_frame_rate.num > 0) e->framerate = st->avg_frame_rate;
+    e->sample_aspect_ratio = av_guess_sample_aspect_ratio(_fmt, st, NULL);
+    e->bit_rate = _vbitrate;
+    e->max_b_frames = 0;           // decode order == display order: simple timing
+    e->gop_size = 100000;          // one keyframe per segment (the first frame)
+    e->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    e->color_primaries = p->color_primaries; e->color_trc = p->color_trc;
+    e->colorspace = p->color_space; e->color_range = p->color_range;
+    AVDictionary *o = NULL;
+    av_dict_set(&o, "profile", "high", 0);
+    if (avcodec_open2(e, ec, &o) < 0) avcodec_free_context(&e);
+    av_dict_free(&o);
+    return e;
+}
+
+// Decode the segment's packets and re-encode the frames whose display time lies in
+// [first keyframe, next segment's keyframe) to H.264.  Output packets carry the
+// source timestamps (stream time base).  `par` (optional) receives the encoder's
+// parameters (avcC) for the init segment.
+- (void)transcodeVideo:(PktList *)raw next:(int64_t)vNext out:(PktList *)out params:(AVCodecParameters *)par {
+    if (raw->n == 0) return;
+    AVCodecContext *enc = [self newVideoEncoder];
+    if (!enc) return;
+    avcodec_flush_buffers(_vdec);
+    AVFrame *fr = av_frame_alloc(), *cv = av_frame_alloc();
+    cv->format = enc->pix_fmt; cv->width = enc->width; cv->height = enc->height;
+    av_frame_get_buffer(cv, 0);
+    AVPacket *ep = av_packet_alloc();
+    __block int64_t lastPts = INT64_MIN, endPts = AV_NOPTS_VALUE, base = AV_NOPTS_VALUE, nOut = 0;
+    __block BOOL first = YES, started = NO, ended = NO;
+    AVStream *vst = _fmt->streams[_v.st];
+    AVRational rate = vst->avg_frame_rate.num > 0 ? vst->avg_frame_rate : vst->r_frame_rate;
+    AVRational frameDur = (AVRational){ rate.den, rate.num };   // seconds per frame
+    BOOL cadence = _vCadence;
+    void (^drainEncoder)(void) = ^{
+        while (avcodec_receive_packet(enc, ep) >= 0) {
+            AVPacket *q = annexBToAVCC(ep);
+            q->dts = q->pts;
+            pl_push(out, q);
+            av_packet_unref(ep);
+        }
+    };
+    void (^emit)(AVFrame *) = ^(AVFrame *f) {
+        int64_t t = f->best_effort_timestamp;
+        // Frames come out in display order: keep those from this segment's keyframe up
+        // to (not including) the next segment's keyframe.  Open-GOP frames that display
+        // before a keyframe but decode after it therefore stay with the earlier segment.
+        if (f->opaque == kSegStart) started = YES;
+        // Without container display times, libavcodec's timestamp guess can jump by
+        // many frames; frames arrive in display order, so count them at the frame rate
+        // from the segment's first frame (whose guessed time is reliable).
+        if (cadence && started && !ended && t != AV_NOPTS_VALUE) {
+            if (base == AV_NOPTS_VALUE) base = t;
+            t = base + av_rescale_q(nOut, frameDur, vst->time_base);
+        }
+        if (f->opaque == kSegEnd) { ended = YES; endPts = t; }
+        if (!started || ended || t == AV_NOPTS_VALUE || t <= lastPts) return;
+        if (cadence) nOut++;
+        lastPts = t;
+        AVFrame *src = f;
+        if (f->format != enc->pix_fmt || f->width != enc->width || f->height != enc->height) {
+            _sws = sws_getCachedContext(_sws, f->width, f->height, f->format, enc->width, enc->height, enc->pix_fmt,
+                                        SWS_BICUBIC, NULL, NULL, NULL);
+            av_frame_make_writable(cv);
+            sws_scale(_sws, (const uint8_t *const *)f->data, f->linesize, 0, f->height, cv->data, cv->linesize);
+            src = cv;
+        }
+        src->pts = t;
+        src->pict_type = first ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+        first = NO;
+        avcodec_send_frame(enc, src);
+        drainEncoder();
+    };
+    for (int i = 0; i <= raw->n; i++) {
+        if (i < raw->n) { if (avcodec_send_packet(_vdec, raw->p[i]) < 0) continue; }
+        else avcodec_send_packet(_vdec, NULL);
+        while (avcodec_receive_frame(_vdec, fr) >= 0) { emit(fr); av_frame_unref(fr); }
+    }
+    avcodec_send_frame(enc, NULL);
+    drainEncoder();
+    // Durations from consecutive timestamps (last one runs to the next segment).
+    for (int i = 0; i < out->n; i++) {
+        int64_t nx = i + 1 < out->n ? out->p[i + 1]->pts : (endPts != AV_NOPTS_VALUE ? endPts : vNext);
+        if (nx != AV_NOPTS_VALUE) out->p[i]->duration = nx - out->p[i]->pts;
+    }
+    if (par) avcodec_parameters_from_context(par, enc);
+    av_packet_free(&ep);
+    av_frame_free(&fr); av_frame_free(&cv);
+    avcodec_free_context(&enc);
+}
+
 // Per-sample output timing for one track, in the output track timescale.
 typedef struct { uint64_t baseDts; uint32_t *dur; int32_t *cto; } Timing;
 
@@ -576,6 +825,9 @@ typedef struct { uint64_t baseDts; uint32_t *dur; int32_t *cto; } Timing;
         for (int i = 0; i < l->n; i++) sorted[i] = pktTime(l->p[i]);
         qsort(sorted, l->n, sizeof(int64_t), cmp_i64);
         int64_t endT = next;
+        // Converted video carries exact per-frame durations up to the next segment's
+        // first displayed frame; prefer them over the container's (decode-time) value.
+        if (_vtranscode && l->p[l->n - 1]->duration > 0) endT = sorted[l->n - 1] + l->p[l->n - 1]->duration;
         if (endT == AV_NOPTS_VALUE) {
             int64_t d = l->p[l->n - 1]->duration;
             if (d <= 0) d = l->n > 1 ? (sorted[l->n - 1] - sorted[0]) / (l->n - 1) : 1;
@@ -701,6 +953,14 @@ static BOOL patchDec3(NSMutableData *buf, NSUInteger o, NSUInteger end) {
         [self collect:k video:&v2 audio:&al vNext:&vn aNext:&an eof:&eof];
         pl_free(&v2);
     }
+    AVCodecParameters *vpar = NULL;
+    if (_vtranscode) {
+        vpar = avcodec_parameters_alloc();
+        PktList ev = {0};
+        [self transcodeVideo:&vl next:vn out:&ev params:vpar];
+        pl_free(&vl); vl = ev;
+        if (vl.n == 0) { avcodec_parameters_free(&vpar); return NO; }
+    }
     AVCodecContext *enc = NULL;
     if (_transcode) {
         PktList enc0 = {0}; int64_t first;
@@ -723,6 +983,7 @@ static BOOL patchDec3(NSMutableData *buf, NSUInteger o, NSUInteger end) {
         AVStream *in = _fmt->streams[trs[t]->st];
         AVStream *os = avformat_new_stream(oc, NULL);
         if (t == 1 && enc) { avcodec_parameters_from_context(os->codecpar, enc); os->time_base = enc->time_base; }
+        else if (t == 0 && vpar) { avcodec_parameters_copy(os->codecpar, vpar); os->time_base = in->time_base; }
         else { avcodec_parameters_copy(os->codecpar, in->codecpar); os->time_base = in->time_base; }
         os->codecpar->codec_tag = 0;
         if (in->codecpar->codec_id == AV_CODEC_ID_HEVC) {
@@ -763,6 +1024,7 @@ static BOOL patchDec3(NSMutableData *buf, NSUInteger o, NSUInteger end) {
     avformat_free_context(oc);
     pl_free(&vl); pl_free(&al);
     if (enc) avcodec_free_context(&enc);
+    if (vpar) avcodec_parameters_free(&vpar);
     if (!ok) return NO;
 
     const uint8_t *d = out.bytes; size_t len = out.length, mlen = 0, flen = 0;
@@ -808,6 +1070,11 @@ static BOOL patchDec3(NSMutableData *buf, NSUInteger o, NSUInteger end) {
     @synchronized (self) {
         PktList vl = {0}, al = {0}; int64_t vn, an; BOOL eof;
         [self collect:k video:&vl audio:&al vNext:&vn aNext:&an eof:&eof];
+        if (_vtranscode) {
+            PktList ev = {0};
+            [self transcodeVideo:&vl next:vn out:&ev params:NULL];
+            pl_free(&vl); vl = ev;
+        }
         if (_transcode) {
             PktList enc = {0}; int64_t first;
             [self transcodeSegment:k raw:&al eof:eof out:&enc firstSample:&first];

@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 BREW="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
-FF=(-I"$BREW/include" -L"$BREW/lib" -lavformat -lavcodec -lavutil -lswresample -Wl,-rpath,"$BREW/lib")
+FF=(-I"$BREW/include" -L"$BREW/lib" -lavformat -lavcodec -lavutil -lswresample -lswscale -Wl,-rpath,"$BREW/lib")
 CF=(-fobjc-arc -O2 -Wall -Wno-four-char-constants -Wno-deprecated-declarations)
 SRC=(src/Segmenter.m src/HLSServer.m src/Subtitles.m)
 

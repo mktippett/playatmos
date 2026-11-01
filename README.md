@@ -69,6 +69,12 @@ MKV ─libavformat demux─▶ Segmenter ─fMP4 segments (stream copy)─▶ HL
 - **Non-Apple codecs** (TrueHD, DTS, FLAC, PCM, Opus …) are decoded by libavcodec and
   re-encoded per segment to ALAC (bit-exact, sample-accurate across segment boundaries).
   These are bed-only (see below).
+- **Video AVFoundation can't decode** (VC-1, MPEG-4 Part 2/XviD, MPEG-2 …) is decoded by
+  libavcodec and re-encoded per segment to H.264 with the VideoToolbox hardware encoder
+  (about 0.25 bits/pixel/frame: ~12 Mb/s for 1080p24, 2 Mb/s minimum). Segments are cut at
+  the display time of the boundary keyframes, so joins are frame-exact even for AVI files
+  with B-frames. 1080p VC-1 converts at roughly 4–8× real time; a seek waits for the first
+  converted segment (up to ~1.5 s). H.264/HEVC/AV1 are never re-encoded.
 
 ## Subtitles
 
@@ -113,8 +119,14 @@ per-channel RMS:
   in real time with no stalls over 30 s runs across segment boundaries.
 - Video frames decode at the source rate (H.264 1080p, HEVC incl. `hev1`). A/V offsets are
   identical in generated segments vs the MKV.
-- TrueHD 5.1 → ALAC: bit-exact vs a direct decode, no boundary discontinuities, correct
-  speaker mapping (per-channel tones). DTS-HD MA 192 kHz: ≈0.33 s per 6 s segment.
+- TrueHD 5.1 → ALAC: bit-exact vs a direct decode, no boundary discontinuities.
+  Speaker mapping: the converted ALAC, decoded by Apple's decoder, matches FFmpeg's
+  decode of the source channel for channel (per-channel tones, and real DTS-HD MA
+  dialogue landing in C). Test files must be checked against FFmpeg's *decode*: some
+  FFmpeg encoders (DTS, TrueHD) rotate the front channels of what they write.
+  DTS-HD MA 192 kHz: ≈0.33 s per 6 s segment.
+- Converted video (VC-1, XviD): every frame compared with a direct decode of the
+  source (48–56 dB PSNR), even timing across segment joins.
 - The app itself opens a file and logs `Atmos recognised by AVPlayer` (AVPlayer reports
   the `ec+3` format list). The window subtitle shows the same.
 - Subtitles: SubRip cue times match `ffmpeg`'s extraction to the millisecond, including
@@ -154,8 +166,9 @@ per-channel RMS:
 - No audio track menu (the best audio track is chosen automatically).
 - Subtitles: ASS styling isn't rendered (plain text only; libass would be needed), and
   sidecar subtitle files must be UTF-8.
-- Video: H.264, HEVC, AV1 (AV1 needs hardware support). Others are refused. Dolby
-  Vision profile 5 is not handled specially.
+- Video: H.264, HEVC and AV1 (AV1 needs hardware support) pass through; anything else is
+  converted to H.264 (a second-generation encode, not bit-exact). Dolby Vision profile 5
+  is not handled specially.
 - MKVs without Cues fall back to a fixed 6 s grid with approximate `#EXTINF`.
 
 ## Layout

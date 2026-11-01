@@ -6,6 +6,8 @@
 //       serve via HLSServer, play with AVPlayer to the device, capture that
 //       device's input (Loopback pass-through) and print per-channel RMS.
 #import <AVFoundation/AVFoundation.h>
+#import <Cocoa/Cocoa.h>
+#import <CoreImage/CoreImage.h>
 #import "../src/Segmenter.h"
 #import "../src/HLSServer.h"
 #import "../src/Subtitles.h"
@@ -107,6 +109,13 @@ int main(int argc, char **argv) { @autoreleasepool {
             size_t bpr = CVPixelBufferGetBytesPerRow(pb), ph = CVPixelBufferGetHeight(pb), pw = CVPixelBufferGetWidth(pb);
             if (px && px[(ph / 2) * bpr + (pw / 2) * 4 + 1] > 128) printf("FLASH frame shown at item time %.4f\n", CMTimeGetSeconds(it));
             CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        }
+        static BOOL saved = NO;   // FRAME=<png>: save the frame shown ~1 s into playback
+        if (pb && getenv("FRAME") && !saved && frames == 24) {
+            saved = YES;
+            CIImage *ci = [CIImage imageWithCVPixelBuffer:pb];
+            NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithCIImage:ci];
+            [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:@(getenv("FRAME")) atomically:YES];
         }
         if (pb) { frames++; w = CVPixelBufferGetWidth(pb); h = CVPixelBufferGetHeight(pb); if (firstT < 0) firstT = CMTimeGetSeconds(it); lastT = CMTimeGetSeconds(it); CVPixelBufferRelease(pb); }
     }];
