@@ -9,6 +9,7 @@
 #import <CoreAudio/CoreAudio.h>
 #import "Segmenter.h"
 #import "HLSServer.h"
+#import "Subtitles.h"
 #import <os/log.h>
 
 // ---------------------------------------------------------------------------
@@ -42,6 +43,10 @@
     NSString *_deviceUID;       // nil = follow system default output
     NSMenu *_outputMenu;
     NSURL *_pendingOpen;
+    Subtitles *_subs;
+    SubtitleView *_subView;
+    NSMenu *_subMenu;
+    id _timeObs;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
@@ -60,6 +65,9 @@
     _pv.controlsStyle = AVPlayerViewControlsStyleFloating;
     _pv.showsFullScreenToggleButton = YES;
     [root addSubview:_pv];
+    _subView = [[SubtitleView alloc] initWithFrame:_pv.contentOverlayView.bounds];
+    _subView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [_pv.contentOverlayView addSubview:_subView];
     _hint = [NSTextField labelWithString:@"Open an MKV file (⌘O) or drop it here"];
     _hint.textColor = NSColor.secondaryLabelColor;
     _hint.font = [NSFont systemFontOfSize:18];
@@ -112,6 +120,11 @@ static NSMenuItem *item(NSString *t, SEL a, NSString *k) { return [[NSMenuItem a
     _outputMenu.delegate = self;   // rebuilt each time it opens
     audioItem.submenu = _outputMenu;
 
+    NSMenuItem *subItem = [NSMenuItem new]; [bar addItem:subItem];
+    _subMenu = [[NSMenu alloc] initWithTitle:@"Subtitles"];
+    _subMenu.delegate = self;
+    subItem.submenu = _subMenu;
+
     NSMenuItem *viewItem = [NSMenuItem new]; [bar addItem:viewItem];
     NSMenu *view = [[NSMenu alloc] initWithTitle:@"View"];
     NSMenuItem *fs = item(@"Enter Full Screen", @selector(toggleFullScreen:), @"f");
@@ -124,6 +137,19 @@ static NSMenuItem *item(NSString *t, SEL a, NSString *k) { return [[NSMenuItem a
 // Audio Output menu: system default + every device with output channels.
 - (void)menuNeedsUpdate:(NSMenu *)menu {
     [menu removeAllItems];
+    if (menu == _subMenu) {
+        NSMenuItem *off = item(@"Off", @selector(chooseSubtitle:), @"");
+        off.state = _subs.selectedTrack == nil ? NSControlStateValueOn : NSControlStateValueOff;
+        [menu addItem:off];
+        if (_subs.tracks.count) [menu addItem:[NSMenuItem separatorItem]];
+        for (SubtitleTrack *t in _subs.tracks) {
+            NSMenuItem *it = item(t.label, @selector(chooseSubtitle:), @"");
+            it.representedObject = t;
+            it.state = t == _subs.selectedTrack ? NSControlStateValueOn : NSControlStateValueOff;
+            [menu addItem:it];
+        }
+        return;
+    }
     NSMenuItem *def = item(@"System Default", @selector(chooseOutput:), @"");
     def.representedObject = nil;
     def.state = _deviceUID == nil ? NSControlStateValueOn : NSControlStateValueOff;
@@ -156,6 +182,11 @@ static NSMenuItem *item(NSString *t, SEL a, NSString *k) { return [[NSMenuItem a
         [menu addItem:it];
     }
     free(ids);
+}
+
+- (void)chooseSubtitle:(NSMenuItem *)sender {
+    [_subs selectTrack:sender.representedObject];
+    _subView.cues = @[]; [_subView setNeedsDisplay:YES];
 }
 
 - (void)chooseOutput:(NSMenuItem *)sender {
@@ -191,16 +222,22 @@ static NSMenuItem *item(NSString *t, SEL a, NSString *k) { return [[NSMenuItem a
     if (!url) return;
     [_win makeKeyAndOrderFront:nil];
     [_player pause];
+    if (_timeObs) { [_player removeTimeObserver:_timeObs]; _timeObs = nil; }
     _pv.player = nil; _player = nil;
     [_server stop]; _server = nil; _seg = nil;
+    [_subs stop]; _subs = nil;
+    _subView.cues = @[]; [_subView setNeedsDisplay:YES];
     _win.title = url.lastPathComponent;
     _win.subtitle = @"Opening…";
     NSString *path = url.path;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *err;
         Segmenter *seg = [Segmenter segmenterWithPath:path error:&err];
+        Subtitles *subs = seg ? [[Subtitles alloc] initWithPath:path] : nil;
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!seg) { self->_win.subtitle = @""; [self fail:err.localizedDescription]; return; }
+            self->_subs = subs;
+            [subs selectTrack:subs.defaultTrack];
             [self startWithSegmenter:seg];
         });
     });
@@ -218,6 +255,17 @@ static NSMenuItem *item(NSString *t, SEL a, NSString *k) { return [[NSMenuItem a
     if (vol) _player.volume = (float)atof(vol);
     _pv.player = _player;
     _win.subtitle = seg.audioSummary;
+    // Subtitles follow the player clock (item time == source time; see Segmenter).
+    __weak AppDelegate *wself = self;
+    _timeObs = [_player addPeriodicTimeObserverForInterval:CMTimeMake(1, 30) queue:dispatch_get_main_queue() usingBlock:^(CMTime t) {
+        AppDelegate *s = wself;
+        if (!s || !s->_subs) return;
+        NSArray *cues = [s->_subs cuesAt:CMTimeGetSeconds(t)];
+        NSRect vr = [s->_subView convertRect:s->_pv.videoBounds fromView:s->_pv];
+        if (![cues isEqualToArray:s->_subView.cues] || !NSEqualRects(vr, s->_subView.videoRect)) {
+            s->_subView.cues = cues; s->_subView.videoRect = vr; [s->_subView setNeedsDisplay:YES];
+        }
+    }];
     os_log(OS_LOG_DEFAULT, "PlayAtmos: video %{public}s; audio %{public}s; %lu segments", seg.videoSummary.UTF8String, seg.audioSummary.UTF8String, (unsigned long)seg.segmentCount);
 
     __weak AppDelegate *ws = self;
@@ -255,6 +303,26 @@ static NSMenuItem *item(NSString *t, SEL a, NSString *k) { return [[NSMenuItem a
         fr.origin = NSMakePoint(NSMidX(vis) - fr.size.width / 2, NSMidY(vis) - fr.size.height / 2);
         [_win setFrame:fr display:YES animate:YES];
         _win.contentAspectRatio = ps;
+    }
+    // Test hooks (automated checks without screen recording):
+    //   PLAYATMOS_SEEK=<sec>      start playback there
+    //   PLAYATMOS_SNAPSHOT=<png>  3 s after start, render the subtitle overlay to a PNG
+    const char *seek = getenv("PLAYATMOS_SEEK"), *snap = getenv("PLAYATMOS_SNAPSHOT");
+    if (seek) [_player seekToTime:CMTimeMakeWithSeconds(atof(seek), 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+    if (snap) {
+        NSString *path = @(snap);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            SubtitleView *v = self->_subView;
+            NSBitmapImageRep *rep = [v bitmapImageRepForCachingDisplayInRect:v.bounds];
+            [v cacheDisplayInRect:v.bounds toBitmapImageRep:rep];
+            [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:path atomically:YES];
+            NSMutableArray *texts = [NSMutableArray array];
+            for (SubtitleCue *c in v.cues) [texts addObject:c.text ?: @"<image>"];
+            os_log(OS_LOG_DEFAULT, "PlayAtmos: snapshot t=%.3f track=%{public}s videoRect=%{public}s overlay=%{public}s cues=%{public}s",
+                   CMTimeGetSeconds(self->_player.currentTime), self->_subs.selectedTrack.label.UTF8String ?: "off",
+                   NSStringFromRect(self->_subView.videoRect).UTF8String, NSStringFromRect(v.bounds).UTF8String,
+                   [texts componentsJoinedByString:@" | "].UTF8String);
+        });
     }
     [_player play];
 }

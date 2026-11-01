@@ -12,6 +12,7 @@ static NSString *const kDefaultUID = @"com.rogueamoeba.Loopback:39FEBD16-3F2D-40
 
 int main(int argc, char **argv) { @autoreleasepool {
     if (argc < 4) { fprintf(stderr, "usage: see source\n"); return 2; }
+    setvbuf(stdout, NULL, _IONBF, 0);
     NSString *mode = @(argv[1]);
     NSError *err;
     NSDate *t0 = [NSDate date];
@@ -51,7 +52,14 @@ int main(int argc, char **argv) { @autoreleasepool {
     if (![srv start:&err]) { fprintf(stderr, "server failed\n"); return 1; }
     AVPlayer *p = [AVPlayer playerWithURL:srv.playlistURL];
     p.audioOutputDeviceUniqueID = uid; p.volume = vol;
-    while (p.currentItem.status == AVPlayerItemStatusUnknown) [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+    NSDate *wait0 = [NSDate date];
+    while (p.currentItem.status == AVPlayerItemStatusUnknown && -wait0.timeIntervalSinceNow < 10) [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+    if (p.currentItem.status == AVPlayerItemStatusUnknown) {
+        fprintf(stderr, "item still not ready after 10 s\n");
+        for (AVPlayerItemErrorLogEvent *e in p.currentItem.errorLog.events) fprintf(stderr, "  errorlog: %ld %s %s\n", (long)e.errorStatusCode, e.errorDomain.UTF8String, e.errorComment.UTF8String);
+        for (AVPlayerItemAccessLogEvent *e in p.currentItem.accessLog.events) fprintf(stderr, "  accesslog: uri %s\n", e.URI.UTF8String);
+        return 1;
+    }
     if (p.currentItem.status != AVPlayerItemStatusReadyToPlay) { fprintf(stderr, "item failed: %s\n", p.currentItem.error.description.UTF8String); return 1; }
     for (AVPlayerItemTrack *t in p.currentItem.tracks)
         for (id fd in t.assetTrack.formatDescriptions) {
@@ -61,13 +69,20 @@ int main(int argc, char **argv) { @autoreleasepool {
     __block BOOL seeked = NO;
     [p seekToTime:CMTimeMakeWithSeconds(seek, 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero completionHandler:^(BOOL f) { seeked = YES; }];
     while (!seeked) [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
-    AVPlayerItemVideoOutput *vo = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:nil];
+    AVPlayerItemVideoOutput *vo = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)}];
     [p.currentItem addOutput:vo];
     __block int frames = 0; __block double firstT = -1, lastT = -1; __block size_t w = 0, h = 0;
     NSTimer *tm = [NSTimer scheduledTimerWithTimeInterval:1/120.0 repeats:YES block:^(NSTimer *t) {
         CMTime it = [vo itemTimeForHostTime:CACurrentMediaTime()];
         if (![vo hasNewPixelBufferForItemTime:it]) return;
         CVPixelBufferRef pb = [vo copyPixelBufferForItemTime:it itemTimeForDisplay:NULL];
+        if (pb && getenv("FLASH")) {   // report frames whose centre is bright (timing test)
+            CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+            const uint8_t *px = CVPixelBufferGetBaseAddress(pb);
+            size_t bpr = CVPixelBufferGetBytesPerRow(pb), ph = CVPixelBufferGetHeight(pb), pw = CVPixelBufferGetWidth(pb);
+            if (px && px[(ph / 2) * bpr + (pw / 2) * 4 + 1] > 128) printf("FLASH frame shown at item time %.4f\n", CMTimeGetSeconds(it));
+            CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        }
         if (pb) { frames++; w = CVPixelBufferGetWidth(pb); h = CVPixelBufferGetHeight(pb); if (firstT < 0) firstT = CMTimeGetSeconds(it); lastT = CMTimeGetSeconds(it); CVPixelBufferRelease(pb); }
     }];
     if (getenv("CAP_SERIES")) gSeries = 0;

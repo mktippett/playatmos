@@ -1,5 +1,6 @@
-# Local Claude Code instructions — never public
+# Local Claude Code instructions and notes — never public
 CLAUDE.md
+the_prompt.txt
 
 # Build output (regenerate with ./build.sh)
 build/
@@ -14,6 +15,10 @@ build/
 *.mov
 *.m4s
 *.m3u8
+*.srt
+*.sup
+*.ass
+*.ssa
 
 # Large data files
 *.nc

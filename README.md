@@ -19,7 +19,8 @@ Requirements: Command Line Tools (clang) and Homebrew `ffmpeg` (the app links
 
 Controls: AVKit's standard controls (scrubber, play/pause, full-screen button),
 plus Space = play/pause, ← / → = skip 10 s, ⌃⌘F = full screen. The **Audio Output** menu
-picks a device. The default is to follow the system output.
+picks a device. The default is to follow the system output. The **Subtitles** menu lists
+the file's subtitle tracks and any sidecar files.
 
 ## Why it is built this way
 
@@ -60,6 +61,23 @@ MKV ─libavformat demux─▶ Segmenter ─fMP4 segments (stream copy)─▶ HL
   re-encoded per segment to ALAC (bit-exact, sample-accurate across segment boundaries).
   These are bed-only (see below).
 
+## Subtitles
+
+Subtitles are drawn by the app over the video, not passed to AVPlayer, so the
+audio/video path that Atmos depends on is untouched. (AVPlayer-based players usually
+convert text subtitles to WebVTT inside the HLS stream and burn image subtitles into the
+video; standalone players such as mpv and VLC draw their own, as PlayAtmos does.)
+
+- A second, independent FFmpeg reader reads only the selected subtitle stream, from 15 s
+  before to 30 s after the playhead, and re-seeks when you jump.
+- Text: SubRip, ASS/SSA, WebVTT, mov_text, shown as plain text (white, dark outline,
+  scaled to the picture). ASS styling and positioning are not reproduced.
+- Images: PGS (Blu-ray), VobSub (DVD), DVB, drawn at their encoded position.
+- Sidecar files next to the video with the same base name (`Movie.srt`, `Movie.en.srt`,
+  `.ass`, `.ssa`, `.vtt`) appear as extra tracks.
+- Off by default, except that a track flagged *forced* (foreign-dialogue lines) is turned
+  on automatically.
+
 ## What has been verified (programmatically)
 
 Each test played through the real pipeline (`build/atmostest`) to a 12-channel
@@ -84,6 +102,11 @@ per-channel RMS:
   speaker mapping (per-channel tones). DTS-HD MA 192 kHz: ≈0.33 s per 6 s segment.
 - The app itself opens a file and logs `Atmos recognised by AVPlayer` (AVPlayer reports
   the `ec+3` format list). The window subtitle shows the same.
+- Subtitles: SubRip cue times match `ffmpeg`'s extraction to the millisecond, including
+  after large forward and backward jumps. A video frame stamped at 10.010 s is on screen
+  at player time 10.013–10.017 s, so cues follow the picture. Sidecar `.srt` (UTF-8,
+  italics stripped) and a PGS sample from FFmpeg's test suite decode and draw correctly.
+  In the app, a forced track is auto-selected and its line appears at the right time.
 
 ## Testing on your own system
 
@@ -111,7 +134,9 @@ per-channel RMS:
 - Bed-only fallback is 5.1. ALAC's 8-channel layout is "7.1 wide" (front Lc/Rc), so 7.1
   rears are folded into the side surrounds. FLAC in HLS played silent in testing.
 - DTS:X objects are not rendered (DTS core / MA decoded as a bed).
-- No subtitles, no audio/subtitle track menu (the best track is chosen automatically).
+- No audio track menu (the best audio track is chosen automatically).
+- Subtitles: ASS styling isn't rendered (plain text only; libass would be needed), and
+  sidecar subtitle files must be UTF-8.
 - Video: H.264, HEVC, AV1 (AV1 needs hardware support). Others are refused. Dolby
   Vision profile 5 is not handled specially.
 - MKVs without Cues fall back to a fixed 6 s grid with approximate `#EXTINF`.
@@ -120,10 +145,15 @@ per-channel RMS:
 
 - `src/Segmenter.[hm]`: demux, track choice, segment index, init/media segment writer, ALAC fallback
 - `src/HLSServer.[hm]`: minimal keep-alive HTTP server on 127.0.0.1
-- `src/main.m`: AppKit app (AVPlayerView, menus, drag and drop, output device menu)
+- `src/Subtitles.[hm]`: subtitle reader/decoder and the overlay view
+- `src/main.m`: AppKit app (AVPlayerView, menus, drag and drop, output device and subtitle menus).
+  Test hooks: `PLAYATMOS_VOLUME`, `PLAYATMOS_SEEK=<sec>`, `PLAYATMOS_SNAPSHOT=<png>`
+  (renders the subtitle overlay 3 s after start)
 - `tools/atmostest.m`: `dump` segments to disk, or `play` through AVPlayer and capture
   per-channel RMS (`CAP_SERIES=1` for a 1 s time series). Pass your device UID as the
   6th argument.
+- `tools/subtest.m`: list subtitle tracks, print active cues at given times, optionally
+  render the overlay to a PNG
 - `tools/capture.m`: capture-only meter for testing the app itself
   (`open --env PLAYATMOS_VOLUME=0.03 -a build/PlayAtmos.app file.mkv`, then `build/capture 8`)
 - `probe/`: the investigation programs behind the table above
