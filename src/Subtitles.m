@@ -1,9 +1,11 @@
 #import "Subtitles.h"
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <stdatomic.h>
 
 // How far behind / ahead of the playhead the embedded-track reader works.
-static const double kReadBehind = 15.0, kReadAhead = 30.0;
+static const double kMaxOpenCue = 10.0;   // longest an image cue is shown without a "clear"
+static const double kReadBehind = 6.0, kReadAhead = 30.0;   // behind: longer than nearly any cue; keeps seeks fast on high-bitrate files
 
 @interface SubtitleTrack ()
 @property (readwrite) NSString *label;
@@ -12,6 +14,7 @@ static const double kReadBehind = 15.0, kReadAhead = 30.0;
 @property BOOL bitmap, sdh;
 @property int stream;                       // stream index in the video file, -1 = external file
 @property (nullable) NSString *externalPath;
+@property int externalStream;               // stream inside the external file (VobSub .idx can hold several), -1 = best
 @end
 @implementation SubtitleTrack
 @end
@@ -98,6 +101,15 @@ static BOOL isBitmapCodec(enum AVCodecID c) {
     double _play;
     BOOL _stop;
     NSThread *_thread;
+    double _readPos;                   // how far the reader has got (guarded by _lock)
+    BOOL _readerEOF;
+    int _clockSt;                      // video stream read alongside, to pace the reader
+    atomic_bool _interrupt;            // set on seek/track change; aborts a blocking read
+}
+
+static int interruptCB(void *opaque) {
+    Subtitles *s = (__bridge Subtitles *)opaque;
+    return atomic_load(&s->_interrupt) ? 1 : 0;
 }
 
 - (instancetype)initWithPath:(NSString *)videoPath {
@@ -105,6 +117,7 @@ static BOOL isBitmapCodec(enum AVCodecID c) {
     _path = videoPath;
     _lock = [NSLock new];
     _cues = [NSMutableArray array];
+    _clockSt = -1;
     NSMutableArray *tracks = [NSMutableArray array];
     if (avformat_open_input(&_fmt, videoPath.fileSystemRepresentation, NULL, NULL) >= 0 &&
         avformat_find_stream_info(_fmt, NULL) >= 0) {
@@ -112,7 +125,10 @@ static BOOL isBitmapCodec(enum AVCodecID c) {
         for (unsigned i = 0; i < _fmt->nb_streams; i++) {
             AVStream *st = _fmt->streams[i];
             AVCodecParameters *p = st->codecpar;
-            if (p->codec_type == AVMEDIA_TYPE_VIDEO && _videoSize.width == 0) _videoSize = CGSizeMake(p->width, p->height);
+            if (p->codec_type == AVMEDIA_TYPE_VIDEO && _videoSize.width == 0 && !(st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+                _videoSize = CGSizeMake(p->width, p->height);
+                _clockSt = (int)i;
+            }
             if (p->codec_type != AVMEDIA_TYPE_SUBTITLE || !avcodec_find_decoder(p->codec_id)) continue;
             SubtitleTrack *t = [SubtitleTrack new];
             t.stream = (int)i;
@@ -136,27 +152,10 @@ static BOOL isBitmapCodec(enum AVCodecID c) {
             [tracks addObject:t];
         }
     }
-    // External subtitle files: same base name, e.g. Movie.srt, Movie.en.srt
-    NSString *dir = videoPath.stringByDeletingLastPathComponent;
-    NSString *base = videoPath.lastPathComponent.stringByDeletingPathExtension;
-    NSArray *files = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil] sortedArrayUsingSelector:@selector(compare:)];
-    for (NSString *f in files) {
-        NSString *ext = f.pathExtension.lowercaseString;
-        if (![@[@"srt", @"ass", @"ssa", @"vtt"] containsObject:ext] || ![f hasPrefix:base]) continue;
-        SubtitleTrack *t = [SubtitleTrack new];
-        t.stream = -1;
-        t.externalPath = [dir stringByAppendingPathComponent:f];
-        t.label = [NSString stringWithFormat:@"%@ (external)", f];
-        // Movie.en.srt / Movie.eng.forced.srt -> language and forced flag from the name
-        for (NSString *part in [[f substringFromIndex:base.length].stringByDeletingPathExtension componentsSeparatedByString:@"."]) {
-            if ([part caseInsensitiveCompare:@"forced"] == NSOrderedSame) t.forced = YES;
-            else if ([part caseInsensitiveCompare:@"sdh"] == NSOrderedSame) t.sdh = YES;
-            else if (!t.language && (part.length == 2 || part.length == 3)) t.language = langCode(part);
-        }
-        [tracks addObject:t];
-    }
+    [self addExternalTracks:tracks forVideo:videoPath];
     _tracks = tracks;
     if (_fmt) {
+        _fmt->interrupt_callback = (AVIOInterruptCB){ interruptCB, (__bridge void *)self };
         _thread = [[NSThread alloc] initWithTarget:self selector:@selector(run) object:nil];
         _thread.name = @"subtitles";
         [_thread start];
@@ -164,11 +163,87 @@ static BOOL isBitmapCodec(enum AVCodecID c) {
     return self;
 }
 
+// Lowercase, letters/digits only: "Before Sunset 2004" ~ "Before.Sunset.2004".
+static NSString *normName(NSString *s) {
+    NSMutableString *o = [NSMutableString string];
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if ([NSCharacterSet.alphanumericCharacterSet characterIsMember:c]) [o appendFormat:@"%C", c];
+    }
+    return o.lowercaseString;
+}
+
+// Sidecar subtitles: in the video's folder or a Subs/Subtitles subfolder.  A file
+// belongs to the video if the folder holds only one video, or its name (ignoring
+// case and punctuation) starts with the video's name.  VobSub .idx files expose
+// one track per language inside.
+- (void)addExternalTracks:(NSMutableArray *)tracks forVideo:(NSString *)videoPath {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *dir = videoPath.stringByDeletingLastPathComponent;
+    NSString *base = normName(videoPath.lastPathComponent.stringByDeletingPathExtension);
+    NSArray *videoExts = @[@"mkv", @"mp4", @"m4v", @"avi", @"mov", @"m2ts", @"ts", @"webm"];
+    NSArray *subExts = @[@"srt", @"ass", @"ssa", @"vtt", @"idx"];
+    NSArray *top = [fm contentsOfDirectoryAtPath:dir error:nil];
+    int videos = 0;
+    for (NSString *f in top)
+        if ([videoExts containsObject:f.pathExtension.lowercaseString] && ![f.lowercaseString containsString:@"sample"]) videos++;
+    NSMutableArray<NSString *> *cands = [NSMutableArray array];
+    for (NSString *f in top) {
+        NSString *full = [dir stringByAppendingPathComponent:f];
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:full isDirectory:&isDir] && isDir &&
+            ([f caseInsensitiveCompare:@"Subs"] == NSOrderedSame || [f caseInsensitiveCompare:@"Subtitles"] == NSOrderedSame)) {
+            for (NSString *g in [fm contentsOfDirectoryAtPath:full error:nil]) [cands addObject:[full stringByAppendingPathComponent:g]];
+        } else [cands addObject:full];
+    }
+    [cands sortUsingSelector:@selector(compare:)];
+    for (NSString *path in cands) {
+        NSString *f = path.lastPathComponent, *ext = f.pathExtension.lowercaseString;
+        if (![subExts containsObject:ext]) continue;
+        NSString *stem = f.stringByDeletingPathExtension;
+        if (videos != 1 && ![normName(stem) hasPrefix:base]) continue;
+        // Trailing name parts: language / forced / sdh, e.g. "Movie.Eng.forced.srt"
+        NSString *nameLang = nil; BOOL forced = NO, sdh = NO;
+        NSArray *parts = [stem componentsSeparatedByString:@"."];
+        for (NSInteger i = (NSInteger)parts.count - 1; i >= 1 && i >= (NSInteger)parts.count - 3; i--) {
+            NSString *q = parts[i];
+            if ([q caseInsensitiveCompare:@"forced"] == NSOrderedSame) forced = YES;
+            else if ([q caseInsensitiveCompare:@"sdh"] == NSOrderedSame) sdh = YES;
+            else if (!nameLang && (q.length == 2 || q.length == 3)) nameLang = langCode(q);
+        }
+        if ([ext isEqualToString:@"idx"]) {
+            AVFormatContext *x = NULL;
+            if (avformat_open_input(&x, path.fileSystemRepresentation, NULL, NULL) < 0) continue;
+            avformat_find_stream_info(x, NULL);
+            for (unsigned i = 0; i < x->nb_streams; i++) {
+                if (x->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) continue;
+                AVDictionaryEntry *lang = av_dict_get(x->streams[i]->metadata, "language", NULL, 0);
+                SubtitleTrack *t = [SubtitleTrack new];
+                t.stream = -1; t.externalPath = path; t.externalStream = (int)i; t.bitmap = YES;
+                t.language = lang ? langCode(@(lang->value)) : nameLang;
+                NSString *name = t.language ? [NSLocale.currentLocale localizedStringForLanguageCode:t.language] : nil;
+                // Number the entries: one .idx often holds several tracks of the same language.
+                t.label = [NSString stringWithFormat:@"%@ · image %u (external %@)", name ?: @"Subtitle", i + 1, f];
+                [tracks addObject:t];
+            }
+            avformat_close_input(&x);
+            continue;
+        }
+        SubtitleTrack *t = [SubtitleTrack new];
+        t.stream = -1; t.externalPath = path; t.externalStream = -1;
+        t.language = nameLang; t.forced = forced; t.sdh = sdh;
+        NSString *name = t.language ? [NSLocale.currentLocale localizedStringForLanguageCode:t.language] : nil;
+        t.label = name ? [NSString stringWithFormat:@"%@ (external %@)", name, f] : [NSString stringWithFormat:@"%@ (external)", f];
+        [tracks addObject:t];
+    }
+}
+
 - (SubtitleTrack *)autoTrackForAudioLanguage:(NSString *)audioLanguage {
     NSMutableArray<NSString *> *mine = [NSMutableArray array];
     for (NSString *p in NSLocale.preferredLanguages) { NSString *c = langCode(p); if (c && ![mine containsObject:c]) [mine addObject:c]; }
     NSString *audio = langCode(audioLanguage);
-    if (audio && ![mine containsObject:audio]) {
+    BOOL multi = [audioLanguage isEqualToString:@"mul"];   // several spoken languages: treat as foreign
+    if (multi || (audio && ![mine containsObject:audio])) {
         // Foreign-language audio: full subtitles in my language (prefer non-SDH).
         for (NSString *L in mine) {
             for (SubtitleTrack *t in _tracks) if ([t.language isEqualToString:L] && !t.forced && !t.sdh) return t;
@@ -183,7 +258,7 @@ static BOOL isBitmapCodec(enum AVCodecID c) {
     return nil;
 }
 
-- (void)stop { [_lock lock]; _stop = YES; [_lock unlock]; }
+- (void)stop { [_lock lock]; _stop = YES; [_lock unlock]; atomic_store(&_interrupt, true); }
 
 - (SubtitleTrack *)selectedTrack { [_lock lock]; SubtitleTrack *t = _sel; [_lock unlock]; return t; }
 
@@ -192,13 +267,23 @@ static BOOL isBitmapCodec(enum AVCodecID c) {
     _sel = track; _gen++;
     [_cues removeAllObjects];
     [_lock unlock];
+    atomic_store(&_interrupt, true);
 }
 
 - (NSArray<SubtitleCue *> *)cuesAt:(double)t {
     NSMutableArray *active = [NSMutableArray array];
     [_lock lock];
+    if (t < _play - 1 || t > _play + 3) {          // a seek: drop stale cues, abort any blocking read
+        if (_sel && _sel.stream >= 0) [_cues removeAllObjects];   // sidecar files are loaded whole; keep them
+        atomic_store(&_interrupt, true);
+    }
     _play = t;
-    for (SubtitleCue *c in _cues) if (c.start <= t && t < c.end) [active addObject:c];
+    // Until the reader has passed the playhead, a later "clear" may still be unread.
+    BOOL caughtUp = _readerEOF || _readPos >= t || (_sel && _sel.stream < 0);
+    for (SubtitleCue *c in caughtUp ? _cues : @[]) {
+        double end = isinf(c.end) ? c.start + kMaxOpenCue : c.end;   // bitmap cue whose "clear" isn't read yet
+        if (c.start <= t && t < end) [active addObject:c];
+    }
     [_lock unlock];
     [active sortUsingComparator:^NSComparisonResult(SubtitleCue *a, SubtitleCue *b) { return a.start < b.start ? NSOrderedAscending : a.start > b.start ? NSOrderedDescending : NSOrderedSame; }];
     return active;
@@ -261,7 +346,7 @@ static AVCodecContext *openDecoder(AVStream *st) {
     AVFormatContext *f = NULL;
     if (avformat_open_input(&f, t.externalPath.fileSystemRepresentation, NULL, NULL) < 0) return;
     avformat_find_stream_info(f, NULL);
-    int si = av_find_best_stream(f, AVMEDIA_TYPE_SUBTITLE, -1, -1, NULL, 0);
+    int si = t.externalStream >= 0 ? t.externalStream : av_find_best_stream(f, AVMEDIA_TYPE_SUBTITLE, -1, -1, NULL, 0);
     AVCodecContext *dc = si >= 0 ? openDecoder(f->streams[si]) : NULL;
     AVPacket *pk = av_packet_alloc();
     while (dc && av_read_frame(f, pk) >= 0) {
@@ -284,6 +369,7 @@ static AVCodecContext *openDecoder(AVStream *st) {
     AVPacket *pk = av_packet_alloc();
     for (;;) {
         @autoreleasepool {
+            atomic_store(&_interrupt, false);
             [_lock lock];
             BOOL stop = _stop; SubtitleTrack *want = _sel; NSUInteger gen = _gen; double play = _play;
             [_lock unlock];
@@ -294,7 +380,7 @@ static AVCodecContext *openDecoder(AVStream *st) {
                 if (tr && tr.stream < 0) [self loadExternal:tr gen:gen];
                 else if (tr) {
                     for (unsigned i = 0; i < _fmt->nb_streams; i++)
-                        _fmt->streams[i]->discard = (int)i == tr.stream ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+                        _fmt->streams[i]->discard = ((int)i == tr.stream || (int)i == _clockSt) ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
                     dc = openDecoder(_fmt->streams[tr.stream]);
                 }
             }
@@ -308,15 +394,21 @@ static AVCodecContext *openDecoder(AVStream *st) {
                 winStart = target; readPos = target; eof = NO;
                 [_lock lock];
                 if (gen == _gen) [_cues removeAllObjects];
+                _readPos = target; _readerEOF = NO;
                 [_lock unlock];
             }
             if (eof || readPos > play + kReadAhead) { [NSThread sleepForTimeInterval:0.1]; continue; }
-            if (av_read_frame(_fmt, pk) < 0) { eof = YES; continue; }
-            if (pk->stream_index == tr.stream) {
-                AVRational tb = _fmt->streams[tr.stream]->time_base;
-                [self decode:pk with:dc tb:tb gen:gen];
-                if (pk->pts != AV_NOPTS_VALUE) readPos = MAX(readPos, pk->pts * av_q2d(tb));
+            int r = av_read_frame(_fmt, pk);
+            if (r == AVERROR_EXIT) continue;                 // interrupted by a seek / track change
+            if (r < 0) { eof = YES; [_lock lock]; _readerEOF = YES; [_lock unlock]; continue; }
+            AVRational tb = _fmt->streams[pk->stream_index]->time_base;
+            // Video packets are read only to pace the reader (each read returns
+            // within a frame instead of running to the next subtitle packet).
+            if (pk->pts != AV_NOPTS_VALUE) {
+                readPos = MAX(readPos, pk->pts * av_q2d(tb));
+                [_lock lock]; _readPos = readPos; [_lock unlock];
             }
+            if (pk->stream_index == tr.stream) [self decode:pk with:dc tb:tb gen:gen];
             av_packet_unref(pk);
         }
     }

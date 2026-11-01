@@ -66,6 +66,10 @@ typedef struct {
     NSString *_path;
     AVFormatContext *_fmt;
     Track _v, _a;
+    // Stream whose index (Matroska Cues) drives segment boundaries and seeking:
+    // the main video stream even when its codec can't be played, because Cues
+    // usually cover video only — seeking on audio would scan from the file start.
+    int _idxSt;
     int64_t *_starts;     // segment start times in microseconds; _starts[_nseg] = INT64_MAX
     NSUInteger _nseg;
     NSData *_init;
@@ -153,6 +157,11 @@ static int audioScore(const AVStream *s) {
         if (c == AV_CODEC_ID_H264 || c == AV_CODEC_ID_HEVC || c == AV_CODEC_ID_AV1) { _v.st = (int)i; break; }
         if (_v.st < 0) _videoSummary = [NSString stringWithFormat:@"%s video is not supported by AVFoundation", avcodec_get_name(c)];
     }
+    _idxSt = -1;
+    for (unsigned i = 0; i < _fmt->nb_streams && _idxSt < 0; i++)
+        if (_fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && !(_fmt->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC))
+            _idxSt = (int)i;
+    if (_v.st >= 0) _idxSt = _v.st;
     int best = -1;
     for (unsigned i = 0; i < _fmt->nb_streams; i++) {
         AVStream *st = _fmt->streams[i];
@@ -188,7 +197,9 @@ static int audioScore(const AVStream *s) {
             BOOL thdAtmos = p->codec_id == AV_CODEC_ID_TRUEHD && p->profile == AV_PROFILE_TRUEHD_ATMOS;
             _audioSummary = [NSString stringWithFormat:@"%s%s%s %d ch → ALAC %d ch (lossless re-encode)%s", avcodec_get_name(p->codec_id),
                              prof ? " " : "", prof ? prof : "", p->ch_layout.nb_channels, _outLayout.nb_channels,
-                             thdAtmos ? " — TrueHD Atmos objects NOT rendered, bed only" : ""];
+                             ""];
+            // Non-ASCII text must go through NSString, not %s (which assumes MacRoman).
+            if (thdAtmos) _audioSummary = [_audioSummary stringByAppendingString:@" — TrueHD Atmos objects NOT rendered, bed only"];
         }
     } else {
         NSMutableArray *names = [NSMutableArray array];
@@ -219,10 +230,10 @@ static int audioScore(const AVStream *s) {
     int64_t target = (int64_t)(kTargetSegmentSeconds * AV_TIME_BASE);
     NSMutableArray<NSNumber *> *b = [NSMutableArray array];
 
-    if (_v.st >= 0) {
-        AVStream *st = _fmt->streams[_v.st];
+    if (_idxSt >= 0) {
+        AVStream *st = _fmt->streams[_idxSt];
         // Matroska loads Cues lazily, on the first seek.
-        av_seek_frame(_fmt, _v.st, av_rescale_q(start + _fmt->duration / 2, AV_TIME_BASE_Q, st->time_base), AVSEEK_FLAG_BACKWARD);
+        av_seek_frame(_fmt, _idxSt, av_rescale_q(start + _fmt->duration / 2, AV_TIME_BASE_Q, st->time_base), AVSEEK_FLAG_BACKWARD);
         int n = avformat_index_get_entries_count(st);
         int64_t *kf = malloc(sizeof(int64_t) * (n + 1)); int nk = 0;
         for (int i = 0; i < n; i++) {
@@ -343,7 +354,7 @@ static int64_t pktTime(const AVPacket *p) { return p->pts != AV_NOPTS_VALUE ? p-
     int64_t a1 = _transcode && s1 != INT64_MAX ? s1 + 200000 : s1;
     if (eof) *eof = NO;
     *vNext = *aNext = AV_NOPTS_VALUE;
-    int seekSt = _v.st >= 0 ? _v.st : _a.st;
+    int seekSt = _idxSt >= 0 ? _idxSt : _a.st;
     AVRational stb = _fmt->streams[seekSt]->time_base;
     int64_t ts = av_rescale_q(s0 - kSeekMarginUs, AV_TIME_BASE_Q, stb);
     if (avformat_seek_file(_fmt, seekSt, INT64_MIN, ts, ts, 0) < 0)
@@ -409,6 +420,41 @@ static int64_t pktTime(const AVPacket *p) { return p->pts != AV_NOPTS_VALUE ? p-
     return nil;
 }
 
+// Explicit downmix matrix (out x in) for the fallback path.  Same-named channels
+// pass through at unity (no normalisation, no LFE bleed, unlike swr's default);
+// side + rear surrounds fold into the 5.1 surrounds at -3 dB each; a 6.1 back
+// centre feeds both surrounds at -3 dB; front-wide channels fold into L/R.
+static void buildMatrix(const AVChannelLayout *in, const AVChannelLayout *out, double *m) {
+    const double h = M_SQRT1_2;
+    int ni = in->nb_channels, no = out->nb_channels;
+    for (int o = 0; o < no; o++) {
+        enum AVChannel oc = av_channel_layout_channel_from_index(out, o);
+        double *row = m + o * ni;
+        for (int i = 0; i < ni; i++) row[i] = 0;
+        // Direct match first.
+        int di = av_channel_layout_index_from_channel(in, oc);
+        // Surround output: gather side/rear inputs.
+        if (oc == AV_CHAN_BACK_LEFT || oc == AV_CHAN_BACK_RIGHT) {
+            BOOL left = oc == AV_CHAN_BACK_LEFT;
+            int side = av_channel_layout_index_from_channel(in, left ? AV_CHAN_SIDE_LEFT : AV_CHAN_SIDE_RIGHT);
+            int back = av_channel_layout_index_from_channel(in, left ? AV_CHAN_BACK_LEFT : AV_CHAN_BACK_RIGHT);
+            int bc = av_channel_layout_index_from_channel(in, AV_CHAN_BACK_CENTER);
+            if (side >= 0 && back >= 0) { row[side] = h; row[back] = h; }
+            else if (side >= 0) row[side] = 1;
+            else if (back >= 0) row[back] = 1;
+            if (bc >= 0) row[bc] = h;
+            continue;
+        }
+        if (di >= 0) row[di] = 1;
+        if (oc == AV_CHAN_FRONT_LEFT || oc == AV_CHAN_FRONT_RIGHT) {
+            int wide = av_channel_layout_index_from_channel(in, oc == AV_CHAN_FRONT_LEFT ? AV_CHAN_FRONT_LEFT_OF_CENTER : AV_CHAN_FRONT_RIGHT_OF_CENTER);
+            if (wide >= 0) row[wide] = h;
+        }
+        // Mono source to stereo/5.1 output: centre-only input feeds front centre (or L+R).
+        if (ni == 1 && no == 2) row[0] = h;
+    }
+}
+
 - (AVCodecContext *)newEncoder {
     const AVCodec *ec = avcodec_find_encoder(AV_CODEC_ID_ALAC);
     AVCodecContext *e = avcodec_alloc_context3(ec);
@@ -434,6 +480,12 @@ static int64_t pktTime(const AVPacket *p) { return p->pts != AV_NOPTS_VALUE ? p-
     static const int map51[6] = { 2, 0, 1, 3, 4, 5 };   // slot -> index in FL FR FC LFE BL BR
     SwrContext *swr = NULL;
     swr_alloc_set_opts2(&swr, &_outLayout, AV_SAMPLE_FMT_S32P, (int)sr, &_dec->ch_layout, _dec->sample_fmt, _dec->sample_rate, 0, NULL);
+    if (swr && _dec->ch_layout.nb_channels > 2 && _dec->ch_layout.order != AV_CHANNEL_ORDER_UNSPEC) {
+        double *mx = calloc((size_t)_outLayout.nb_channels * _dec->ch_layout.nb_channels, sizeof(double));
+        buildMatrix(&_dec->ch_layout, &_outLayout, mx);
+        swr_set_matrix(swr, mx, _dec->ch_layout.nb_channels);
+        free(mx);
+    }
     if (!swr || swr_init(swr) < 0) { swr_free(&swr); return; }
 
     size_t cap = 0, have = 0;

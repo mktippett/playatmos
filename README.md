@@ -82,8 +82,11 @@ video; standalone players such as mpv and VLC draw their own, as PlayAtmos does.
 - Text: SubRip, ASS/SSA, WebVTT, mov_text, shown as plain text (white, dark outline,
   scaled to the picture). ASS styling and positioning are not reproduced.
 - Images: PGS (Blu-ray), VobSub (DVD), DVB, drawn at their encoded position.
-- Sidecar files next to the video with the same base name (`Movie.srt`, `Movie.en.srt`,
-  `.ass`, `.ssa`, `.vtt`) appear as extra tracks.
+- Sidecar files appear as extra tracks: `.srt`, `.ass`, `.ssa`, `.vtt` and VobSub
+  `.idx`/`.sub` (each language inside an `.idx` is its own track), in the video's folder
+  or a `Subs`/`Subtitles` subfolder. A file belongs to the video if the folder holds only
+  one video, or its name matches the video's (ignoring case and punctuation). The
+  language comes from the file or a trailing name part (`.Eng.srt`, `.FR.srt`).
 - Automatic choice, like the Apple TV app's "Auto", based on your preferred languages in
   System Settings: if the audio is in a language you don't use, a full subtitle track in
   your language is turned on; otherwise only a *forced* track (foreign-dialogue lines) in
@@ -143,8 +146,10 @@ per-channel RMS:
   Atmos Master Format) plus [Cavern](https://cavern.sbence.hu/cavern/downloads.php)
   (renderer). Both are separate Rust/.NET projects, not real-time libraries for a
   native player.
-- Bed-only fallback is 5.1. ALAC's 8-channel layout is "7.1 wide" (front Lc/Rc), so 7.1
-  rears are folded into the side surrounds. FLAC in HLS played silent in testing.
+- Bed-only fallback is 5.1. ALAC's 8-channel layout is "7.1 wide" (front Lc/Rc), so true
+  7.1 can't be carried; FLAC in HLS played silent in testing. Front channels and LFE pass
+  through bit-exact; 7.1 side + rear surrounds (and a 6.1 back centre) fold into the 5.1
+  surrounds at −3 dB each.
 - DTS:X objects are not rendered (DTS core / MA decoded as a bed).
 - No audio track menu (the best audio track is chosen automatically).
 - Subtitles: ASS styling isn't rendered (plain text only; libass would be needed), and

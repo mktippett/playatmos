@@ -1,12 +1,16 @@
 // Test harness.
 //   atmostest dump <file> <outdir> [firstSeg] [nSegs]   write playlist/init/segments to disk
+//   atmostest check <file> -                            one-line health check (no output files, no sound):
+//       open, init segment, first/middle/last segment, audio decision, auto subtitles
 //   atmostest play <file> <seekSec> <seconds> [volume] [deviceUID]
 //       serve via HLSServer, play with AVPlayer to the device, capture that
 //       device's input (Loopback pass-through) and print per-channel RMS.
 #import <AVFoundation/AVFoundation.h>
 #import "../src/Segmenter.h"
 #import "../src/HLSServer.h"
+#import "../src/Subtitles.h"
 #include "cap.h"
+#include <libavutil/log.h>
 
 static NSString *const kDefaultUID = @"com.rogueamoeba.Loopback:39FEBD16-3F2D-4064-9FAE-B105143B9734"; // "7.1.4 (atmos)"
 
@@ -16,6 +20,27 @@ int main(int argc, char **argv) { @autoreleasepool {
     NSString *mode = @(argv[1]);
     NSError *err;
     NSDate *t0 = [NSDate date];
+    if ([mode isEqualToString:@"check"]) {
+        av_log_set_level(AV_LOG_QUIET);
+        Segmenter *s = [Segmenter segmenterWithPath:@(argv[2]) error:&err];
+        double topen = -t0.timeIntervalSinceNow;
+        if (!s) { printf("FAIL\topen\t%.2f\t%s\n", topen, err.localizedDescription.UTF8String); return 1; }
+        NSUInteger n = s.segmentCount, ks[3] = { 0, n / 2, n ? n - 1 : 0 };
+        NSMutableString *segs = [NSMutableString string]; BOOL bad = NO;
+        for (int i = 0; i < 3; i++) {
+            NSDate *ts = [NSDate date];
+            NSData *d = [s mediaSegment:ks[i]];
+            if (d.length < 1000) bad = YES;
+            [segs appendFormat:@"%s%lu:%.0fKB/%.2fs", i ? " " : "", (unsigned long)ks[i], d.length / 1024.0, -ts.timeIntervalSinceNow];
+        }
+        Subtitles *sub = [[Subtitles alloc] initWithPath:@(argv[2])];
+        SubtitleTrack *auto_ = [sub autoTrackForAudioLanguage:s.audioLanguage];
+        [sub stop];
+        printf("%s\topen=%.2fs\tsegs=%lu\t%s\tvideo=%s\taudio=%s\taudioLang=%s\tsubs=%lu\tauto=%s\n", bad ? "FAIL" : "OK", topen,
+               (unsigned long)n, segs.UTF8String, s.videoSummary.UTF8String ?: "-", s.audioSummary.UTF8String,
+               s.audioLanguage.UTF8String ?: "-", (unsigned long)sub.tracks.count, auto_.label.UTF8String ?: "off");
+        return bad;
+    }
     Segmenter *s = [Segmenter segmenterWithPath:@(argv[2]) error:&err];
     if (!s) { fprintf(stderr, "open failed: %s\n", err.localizedDescription.UTF8String); return 1; }
     printf("open %.2fs  segments %lu  duration %.1fs\nvideo: %s\naudio: %s\n", -t0.timeIntervalSinceNow,
