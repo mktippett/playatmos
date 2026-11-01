@@ -10,11 +10,23 @@ SRC=(src/Segmenter.m src/HLSServer.m src/Subtitles.m)
 
 APP=build/PlayAtmos.app
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p build "$APP/Contents/MacOS" "$APP/Contents/Resources"
 clang "${CF[@]}" src/main.m "${SRC[@]}" "${FF[@]}" \
   -framework Cocoa -framework AVKit -framework AVFoundation -framework CoreMedia -framework CoreAudio \
   -o "$APP/Contents/MacOS/PlayAtmos"
 cp Info.plist "$APP/Contents/Info.plist"
+# App icon: drawn by tools/makeicon, rebuilt only when its source changes.
+if [ ! -f build/AppIcon.icns ] || [ tools/makeicon.m -nt build/AppIcon.icns ]; then
+  clang "${CF[@]}" tools/makeicon.m -framework Cocoa -o build/makeicon
+  rm -rf build/AppIcon.iconset && mkdir -p build/AppIcon.iconset
+  build/makeicon build/icon_1024.png
+  for s in 16 32 128 256 512; do
+    sips -z $s $s build/icon_1024.png --out build/AppIcon.iconset/icon_${s}x${s}.png >/dev/null
+    sips -z $((2*s)) $((2*s)) build/icon_1024.png --out build/AppIcon.iconset/icon_${s}x${s}@2x.png >/dev/null
+  done
+  iconutil -c icns build/AppIcon.iconset -o build/AppIcon.icns
+fi
+cp build/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 codesign --force -s - "$APP" >/dev/null 2>&1 || true
 
 clang "${CF[@]}" tools/atmostest.m "${SRC[@]}" "${FF[@]}" \
