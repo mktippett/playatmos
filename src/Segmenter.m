@@ -301,23 +301,36 @@ static int audioScore(const AVStream *s) {
                  (int)ceil(maxDur), m];
 }
 
-- (void)prepareLeadingSilence {
-    if (_a.st < 0 || _transcode) return;
-    AVCodecParameters *p = _fmt->streams[_a.st]->codecpar;
-    if (p->codec_id != AV_CODEC_ID_EAC3 && p->codec_id != AV_CODEC_ID_AC3) return;
-    // First audio and first video timestamps.
+// Earliest timestamp of one stream (min over its first packets, to allow for
+// B-frame reordering), reading that stream alone.
+- (int64_t)firstTimeOfStream:(int)si {
+    for (unsigned i = 0; i < _fmt->nb_streams; i++) _fmt->streams[i]->discard = (int)i == si ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
     avformat_seek_file(_fmt, -1, INT64_MIN, INT64_MIN, INT64_MIN, 0);
-    int64_t firstA = AV_NOPTS_VALUE, firstVus = INT64_MAX;
+    int64_t first = AV_NOPTS_VALUE;
     AVPacket *pk = av_packet_alloc();
-    for (int i = 0; i < 20000 && firstA == AV_NOPTS_VALUE && av_read_frame(_fmt, pk) >= 0; i++) {
-        int64_t t = pktTime(pk);
-        if (t != AV_NOPTS_VALUE) {
-            if (pk->stream_index == _a.st) firstA = t;
-            else if (pk->stream_index == _v.st) firstVus = MIN(firstVus, av_rescale_q(t, _v.tb, AV_TIME_BASE_Q));
+    for (int n = 0; n < 32 && av_read_frame(_fmt, pk) >= 0; ) {
+        if (pk->stream_index == si) {
+            int64_t t = pktTime(pk);
+            if (t != AV_NOPTS_VALUE && (first == AV_NOPTS_VALUE || t < first)) first = t;
+            n++;
         }
         av_packet_unref(pk);
     }
     av_packet_free(&pk);
+    for (unsigned i = 0; i < _fmt->nb_streams; i++) _fmt->streams[i]->discard = AVDISCARD_DEFAULT;
+    return first;
+}
+
+- (void)prepareLeadingSilence {
+    if (_a.st < 0 || _transcode) return;
+    AVCodecParameters *p = _fmt->streams[_a.st]->codecpar;
+    if (p->codec_id != AV_CODEC_ID_EAC3 && p->codec_id != AV_CODEC_ID_AC3) return;
+    // First audio and first video timestamps.  Each stream is read on its own:
+    // files that aren't interleaved by time (many MP4s store long runs of one
+    // track) would otherwise report a far-too-late first audio packet.
+    int64_t firstA = [self firstTimeOfStream:_a.st];
+    int64_t firstV = _v.st >= 0 ? [self firstTimeOfStream:_v.st] : AV_NOPTS_VALUE;
+    int64_t firstVus = firstV != AV_NOPTS_VALUE ? av_rescale_q(firstV, _v.tb, AV_TIME_BASE_Q) : INT64_MAX;
     if (firstA == AV_NOPTS_VALUE) return;
     int64_t startUs = firstVus != INT64_MAX ? firstVus : (_fmt->start_time != AV_NOPTS_VALUE ? _fmt->start_time : 0);
     if (av_rescale_q(firstA, _a.tb, AV_TIME_BASE_Q) - startUs < 50000) return;   // no meaningful gap
