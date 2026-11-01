@@ -1,4 +1,4 @@
-// subtest <file> <trackIndex|-1> <t1> [t2 ...] [--png out.png]
+// subtest <file> <trackIndex|auto[:audioLang]> <t1> [t2 ...] [--png out.png]
 // Lists subtitle tracks, selects one, and prints the cues active at each time
 // (times may jump around, like seeks).  --png renders the overlay for the last
 // time over a grey 1920x1080 "video" so the drawing can be inspected.
@@ -9,10 +9,14 @@ int main(int argc, char **argv) { @autoreleasepool {
     if (argc < 4) { fprintf(stderr, "usage: subtest file track t1 [t2...] [--png out.png]\n"); return 2; }
     Subtitles *s = [[Subtitles alloc] initWithPath:@(argv[1])];
     for (NSUInteger i = 0; i < s.tracks.count; i++)
-        printf("track %lu: %s%s\n", (unsigned long)i, s.tracks[i].label.UTF8String, s.tracks[i] == s.defaultTrack ? "   [default]" : "");
-    int ti = atoi(argv[2]);
-    if (ti < 0) { [s selectTrack:s.defaultTrack]; printf("selected default: %s\n", s.defaultTrack.label.UTF8String ?: "off"); }
-    else [s selectTrack:s.tracks[ti]];
+        printf("track %lu: %s  [lang %s%s]\n", (unsigned long)i, s.tracks[i].label.UTF8String,
+               s.tracks[i].language.UTF8String ?: "-", s.tracks[i].forced ? ", forced" : "");
+    if (!strncmp(argv[2], "auto", 4)) {
+        NSString *audio = argv[2][4] == ':' ? @(argv[2] + 5) : nil;
+        SubtitleTrack *t = [s autoTrackForAudioLanguage:audio];
+        [s selectTrack:t];
+        printf("auto (audio %s): %s\n", audio.UTF8String ?: "unknown", t.label.UTF8String ?: "off");
+    } else [s selectTrack:s.tracks[atoi(argv[2])]];
     NSString *png = nil; NSArray *last = @[];
     for (int a = 3; a < argc; a++) {
         if (!strcmp(argv[a], "--png") && a + 1 < argc) { png = @(argv[++a]); continue; }

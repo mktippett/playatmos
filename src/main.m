@@ -237,7 +237,7 @@ static NSMenuItem *item(NSString *t, SEL a, NSString *k) { return [[NSMenuItem a
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!seg) { self->_win.subtitle = @""; [self fail:err.localizedDescription]; return; }
             self->_subs = subs;
-            [subs selectTrack:subs.defaultTrack];
+            [subs selectTrack:[subs autoTrackForAudioLanguage:seg.audioLanguage]];
             [self startWithSegmenter:seg];
         });
     });

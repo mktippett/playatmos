@@ -19,6 +19,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (readonly) NSString *videoSummary;
 /// YES when the selected audio is E-AC-3 with Atmos (JOC) and is passed through untouched.
 @property (readonly) BOOL atmosPassthrough;
+/// Language tag of the selected audio track (as in the file, e.g. "kor"), nil if untagged.
+@property (readonly, nullable) NSString *audioLanguage;
 @property (readonly) NSUInteger segmentCount;
 @property (readonly) double duration;
 

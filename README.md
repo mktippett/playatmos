@@ -14,6 +14,10 @@ macOS 26 with a 12-channel 7.1.4 output device.
 open build/PlayAtmos.app   # ⌘O, drag a file onto the window, or "Open With" in Finder
 ```
 
+Files on network shares play fine once the share is mounted (Finder → Go → Connect to
+Server, e.g. `nfs://server/export`); open them from `/Volumes/…`. `nfs://` URLs can't be
+opened directly.
+
 Requirements: Command Line Tools (clang) and Homebrew `ffmpeg` (the app links
 `/opt/homebrew/lib/libav*.dylib`, so it is not self-contained).
 
@@ -55,6 +59,11 @@ MKV ─libavformat demux─▶ Segmenter ─fMP4 segments (stream copy)─▶ HL
   libavformat, so it is set to 16 (heuristic; verified to work).
 - **hev1 fix.** HEVC with in-band parameter sets (`hev1`) gets a full `hvcC`,
   because AVFoundation needs one.
+- **Audio that starts after the video** (seen in some web releases: audio from 9.4 s):
+  AVPlayer won't start until every track has data and would skip the opening, so the gap
+  is filled with silent (E-AC-3/AC-3) frames ending exactly where the real audio begins.
+  The fallback path pads gaps with digital silence. Files are also analysed for up to
+  30 s at open, so late-starting Atmos tracks are still recognised.
 - **Audio track choice:** E-AC-3 JOC always wins. Otherwise lossless (TrueHD, DTS-HD MA,
   FLAC, PCM) > E-AC-3 > AC-3 > AAC.
 - **Non-Apple codecs** (TrueHD, DTS, FLAC, PCM, Opus …) are decoded by libavcodec and
@@ -75,8 +84,11 @@ video; standalone players such as mpv and VLC draw their own, as PlayAtmos does.
 - Images: PGS (Blu-ray), VobSub (DVD), DVB, drawn at their encoded position.
 - Sidecar files next to the video with the same base name (`Movie.srt`, `Movie.en.srt`,
   `.ass`, `.ssa`, `.vtt`) appear as extra tracks.
-- Off by default, except that a track flagged *forced* (foreign-dialogue lines) is turned
-  on automatically.
+- Automatic choice, like the Apple TV app's "Auto", based on your preferred languages in
+  System Settings: if the audio is in a language you don't use, a full subtitle track in
+  your language is turned on; otherwise only a *forced* track (foreign-dialogue lines) in
+  your language; otherwise none. Sidecar names like `Movie.en.forced.srt` supply the
+  language and forced flag.
 
 ## What has been verified (programmatically)
 

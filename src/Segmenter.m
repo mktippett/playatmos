@@ -77,7 +77,15 @@ typedef struct {
     AVCodecContext *_dec;
     AVChannelLayout _outLayout;
     int _outRate;
+    // Leading-gap filler for passthrough E-AC-3/AC-3 whose audio starts after the
+    // video: AVPlayer will not start until every track has data, so it would skip
+    // the opening.  Silent frames (one encoded frame, repeated) cover the gap.
+    AVPacket *_silence;
+    int64_t _firstAudioPts, _silenceDur;   // audio time base
 }
+
+static void *const kSynthetic = (void *)&kSynthetic;   // AVPacket.opaque tag for filler frames
+static int realCount(const PktList *l) { int n = 0; for (int i = 0; i < l->n; i++) n += l->p[i]->opaque != kSynthetic; return n; }
 
 static NSError *mkerr(NSString *msg) {
     return [NSError errorWithDomain:@"PlayAtmos" code:1 userInfo:@{NSLocalizedDescriptionKey: msg}];
@@ -118,6 +126,7 @@ static int audioScore(const AVStream *s) {
 }
 
 - (void)dealloc {
+    if (_silence) av_packet_free(&_silence);
     if (_dec) avcodec_free_context(&_dec);
     av_channel_layout_uninit(&_outLayout);
     if (_fmt) avformat_close_input(&_fmt);
@@ -126,7 +135,14 @@ static int audioScore(const AVStream *s) {
 
 - (NSString *)open {
     av_log_set_level(AV_LOG_ERROR);
-    if (avformat_open_input(&_fmt, _path.fileSystemRepresentation, NULL, NULL) < 0) return @"Could not open file.";
+    // Analyse further than FFmpeg's default (~5 s): some files start their audio
+    // late (e.g. at 9 s), and E-AC-3 Atmos (JOC) is only detected by decoding a frame.
+    AVDictionary *oo = NULL;
+    av_dict_set(&oo, "analyzeduration", "30000000", 0);   // 30 s
+    av_dict_set(&oo, "probesize", "100000000", 0);         // 100 MB
+    int orc = avformat_open_input(&_fmt, _path.fileSystemRepresentation, NULL, &oo);
+    av_dict_free(&oo);
+    if (orc < 0) return @"Could not open file.";
     if (avformat_find_stream_info(_fmt, NULL) < 0) return @"Could not read stream info.";
 
     _v.st = -1; _a.st = -1;
@@ -156,6 +172,8 @@ static int audioScore(const AVStream *s) {
         AVCodecParameters *p = st->codecpar;
         _a.tb = st->time_base;
         _a.frameSize = p->frame_size;
+        AVDictionaryEntry *lang = av_dict_get(st->metadata, "language", NULL, 0);
+        if (lang && lang->value[0] && strcmp(lang->value, "und")) _audioLanguage = @(lang->value);
         _atmosPassthrough = isAtmosEAC3(p);
         _transcode = p->codec_id != AV_CODEC_ID_EAC3 && p->codec_id != AV_CODEC_ID_AC3 && p->codec_id != AV_CODEC_ID_AAC;
         const char *prof = avcodec_profile_name(p->codec_id, p->profile);
@@ -184,6 +202,7 @@ static int audioScore(const AVStream *s) {
     if (_duration <= 0) return @"File has unknown duration.";
     [self buildSegments];
 
+    [self prepareLeadingSilence];
     _cache = [NSCache new];
     _cache.countLimit = 6;
     if (![self buildInit]) return @"Could not generate MP4 initialization segment.";
@@ -244,6 +263,63 @@ static int audioScore(const AVStream *s) {
                  (int)ceil(maxDur), m];
 }
 
+- (void)prepareLeadingSilence {
+    if (_a.st < 0 || _transcode) return;
+    AVCodecParameters *p = _fmt->streams[_a.st]->codecpar;
+    if (p->codec_id != AV_CODEC_ID_EAC3 && p->codec_id != AV_CODEC_ID_AC3) return;
+    // First audio and first video timestamps.
+    avformat_seek_file(_fmt, -1, INT64_MIN, INT64_MIN, INT64_MIN, 0);
+    int64_t firstA = AV_NOPTS_VALUE, firstVus = INT64_MAX;
+    AVPacket *pk = av_packet_alloc();
+    for (int i = 0; i < 20000 && firstA == AV_NOPTS_VALUE && av_read_frame(_fmt, pk) >= 0; i++) {
+        int64_t t = pktTime(pk);
+        if (t != AV_NOPTS_VALUE) {
+            if (pk->stream_index == _a.st) firstA = t;
+            else if (pk->stream_index == _v.st) firstVus = MIN(firstVus, av_rescale_q(t, _v.tb, AV_TIME_BASE_Q));
+        }
+        av_packet_unref(pk);
+    }
+    av_packet_free(&pk);
+    if (firstA == AV_NOPTS_VALUE) return;
+    int64_t startUs = firstVus != INT64_MAX ? firstVus : (_fmt->start_time != AV_NOPTS_VALUE ? _fmt->start_time : 0);
+    if (av_rescale_q(firstA, _a.tb, AV_TIME_BASE_Q) - startUs < 50000) return;   // no meaningful gap
+
+    // Encode one silent frame with FFmpeg's (E-)AC-3 encoder.
+    const AVCodec *ec = avcodec_find_encoder(p->codec_id);
+    AVCodecContext *e = ec ? avcodec_alloc_context3(ec) : NULL;
+    if (!e) return;
+    e->sample_rate = p->sample_rate;
+    e->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    e->bit_rate = 192000;
+    e->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT1;
+    e->time_base = (AVRational){1, p->sample_rate};
+    if (avcodec_open2(e, ec, NULL) >= 0) {
+        AVFrame *fr = av_frame_alloc();
+        AVPacket *out = av_packet_alloc();
+        for (int i = 0; i < 4; i++) {
+            fr->nb_samples = e->frame_size; fr->format = e->sample_fmt; fr->sample_rate = e->sample_rate;
+            av_channel_layout_copy(&fr->ch_layout, &e->ch_layout);
+            av_frame_get_buffer(fr, 0);
+            for (int c = 0; c < fr->ch_layout.nb_channels; c++) memset(fr->extended_data[c], 0, fr->nb_samples * 4);
+            fr->pts = (int64_t)i * e->frame_size;
+            avcodec_send_frame(e, fr);
+            av_frame_unref(fr);
+            while (avcodec_receive_packet(e, out) >= 0) {
+                if (_silence) av_packet_free(&_silence);
+                _silence = av_packet_clone(out);
+                av_packet_unref(out);
+            }
+        }
+        av_packet_free(&out); av_frame_free(&fr);
+        _silenceDur = av_rescale_q(e->frame_size, (AVRational){1, p->sample_rate}, _a.tb);
+    }
+    avcodec_free_context(&e);
+    if (!_silence || _silenceDur <= 0) { if (_silence) av_packet_free(&_silence); return; }
+    _firstAudioPts = firstA;
+    // Filler frames run back from the first real frame, so they join it seamlessly.
+    _audioSummary = [_audioSummary stringByAppendingFormat:@" (silence added before audio starts at %.2f s)", firstA * av_q2d(_a.tb)];
+}
+
 - (NSUInteger)segmentCount { return _nseg; }
 - (NSString *)playlist { return _playlist; }
 - (NSData *)initializationSegment { return _init; }
@@ -295,6 +371,24 @@ static int64_t pktTime(const AVPacket *p) { return p->pts != AV_NOPTS_VALUE ? p-
         av_packet_unref(pk);
     }
     av_packet_free(&pk);
+    if (_silence) {   // prepend filler frames that fall in this segment's audio window
+        PktList syn = {0};
+        int64_t startTb = av_rescale_q(_starts[0], AV_TIME_BASE_Q, _a.tb);
+        int64_t n = (_firstAudioPts - startTb + _silenceDur - 1) / _silenceDur;
+        for (int64_t j = n; j >= 1; j--) {
+            int64_t pts = _firstAudioPts - j * _silenceDur;
+            int64_t us = av_rescale_q(pts, _a.tb, AV_TIME_BASE_Q);
+            if (us < a0 || us >= a1) continue;
+            AVPacket *q = av_packet_clone(_silence);
+            q->pts = q->dts = pts; q->duration = _silenceDur; q->stream_index = _a.st; q->opaque = kSynthetic;
+            pl_push(&syn, q);
+        }
+        if (syn.n) {
+            for (int i = 0; i < al->n; i++) pl_push(&syn, al->p[i]);
+            free(al->p);
+            *al = syn;
+        }
+    }
 }
 
 // --- Transcode fallback ----------------------------------------------------
@@ -372,6 +466,11 @@ static int64_t pktTime(const AVPacket *p) { return p->pts != AV_NOPTS_VALUE ? p-
             for (int j = 0; j < got; j++, pos++) {
                 if (pos < n0) continue;
                 if (pos >= n1) { done = YES; break; }
+                while (n0 + (int64_t)have < pos) {   // gap in the source audio: pad with silence
+                    if (have == cap) { cap = cap ? cap * 2 : 1 << 16; for (int c = 0; c < nch; c++) pcm[c] = realloc(pcm[c], cap * 4); }
+                    for (int c = 0; c < nch; c++) pcm[c][have] = 0;
+                    have++;
+                }
                 if (have == cap) { cap = cap ? cap * 2 : 1 << 16; for (int c = 0; c < nch; c++) pcm[c] = realloc(pcm[c], cap * 4); }
                 for (int c = 0; c < nch; c++) pcm[c][have] = tmp[nch == 6 ? map51[c] : c][j];
                 have++;
@@ -543,6 +642,13 @@ static BOOL patchDec3(NSMutableData *buf, NSUInteger o, NSUInteger end) {
 - (BOOL)buildInit {
     PktList vl = {0}, al = {0}; int64_t vn, an; BOOL eof;
     [self collect:0 video:&vl audio:&al vNext:&vn aNext:&an eof:&eof];
+    // The muxer must see audio packets to build dec3/esds.  If the audio starts
+    // later than the first segment, take it from the first segment that has some.
+    for (NSUInteger k = 1; _a.st >= 0 && realCount(&al) == 0 && k < MIN(_nseg, 20); k++) {
+        PktList v2 = {0};
+        [self collect:k video:&v2 audio:&al vNext:&vn aNext:&an eof:&eof];
+        pl_free(&v2);
+    }
     AVCodecContext *enc = NULL;
     if (_transcode) {
         PktList enc0 = {0}; int64_t first;
@@ -583,7 +689,9 @@ static BOOL patchDec3(NSMutableData *buf, NSUInteger o, NSUInteger end) {
     for (int t = 0; t < 2 && ok; t++) {
         if (outIndex[t] < 0) continue;
         int64_t prevDts = INT64_MIN;
-        for (int i = 0; i < MIN(ls[t]->n, 8); i++) {
+        for (int i = 0, fed = 0; i < ls[t]->n && fed < 8; i++) {
+            if (ls[t]->p[i]->opaque == kSynthetic) continue;   // codec headers from real frames only
+            fed++;
             AVPacket *p = av_packet_clone(ls[t]->p[i]);
             p->stream_index = outIndex[t];
             int64_t tt = pktTime(p);

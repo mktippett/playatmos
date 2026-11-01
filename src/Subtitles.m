@@ -8,7 +8,8 @@ static const double kReadBehind = 15.0, kReadAhead = 30.0;
 @interface SubtitleTrack ()
 @property (readwrite) NSString *label;
 @property (readwrite) BOOL forced;
-@property BOOL bitmap;
+@property (readwrite, nullable) NSString *language;
+@property BOOL bitmap, sdh;
 @property int stream;                       // stream index in the video file, -1 = external file
 @property (nullable) NSString *externalPath;
 @end
@@ -75,6 +76,13 @@ static CGImageRef imageFromRect(const AVSubtitleRect *r) {
     return img;
 }
 
+// "eng", "ger", "en-US" ... -> "en", "de", "en"; nil for missing/undetermined.
+static NSString *langCode(NSString *tag) {
+    if (!tag.length || [tag isEqualToString:@"und"]) return nil;
+    NSString *c = [NSLocale localeWithLocaleIdentifier:tag].languageCode;
+    return c.length == 2 ? c : nil;
+}
+
 static BOOL isBitmapCodec(enum AVCodecID c) {
     return c == AV_CODEC_ID_HDMV_PGS_SUBTITLE || c == AV_CODEC_ID_DVD_SUBTITLE || c == AV_CODEC_ID_DVB_SUBTITLE;
 }
@@ -113,6 +121,9 @@ static BOOL isBitmapCodec(enum AVCodecID c) {
             t.forced = (st->disposition & AV_DISPOSITION_FORCED) != 0;
             AVDictionaryEntry *lang = av_dict_get(st->metadata, "language", NULL, 0);
             AVDictionaryEntry *title = av_dict_get(st->metadata, "title", NULL, 0);
+            t.language = lang ? langCode(@(lang->value)) : nil;
+            t.sdh = (st->disposition & AV_DISPOSITION_HEARING_IMPAIRED) || (title && strstr(title->value, "SDH"));
+            if (title && strcasestr(title->value, "forced")) t.forced = YES;
             NSMutableArray *parts = [NSMutableArray array];
             NSString *code = lang ? @(lang->value) : nil;
             NSString *name = code ? [NSLocale.currentLocale localizedStringForLanguageCode:code] : nil;
@@ -136,16 +147,40 @@ static BOOL isBitmapCodec(enum AVCodecID c) {
         t.stream = -1;
         t.externalPath = [dir stringByAppendingPathComponent:f];
         t.label = [NSString stringWithFormat:@"%@ (external)", f];
+        // Movie.en.srt / Movie.eng.forced.srt -> language and forced flag from the name
+        for (NSString *part in [[f substringFromIndex:base.length].stringByDeletingPathExtension componentsSeparatedByString:@"."]) {
+            if ([part caseInsensitiveCompare:@"forced"] == NSOrderedSame) t.forced = YES;
+            else if ([part caseInsensitiveCompare:@"sdh"] == NSOrderedSame) t.sdh = YES;
+            else if (!t.language && (part.length == 2 || part.length == 3)) t.language = langCode(part);
+        }
         [tracks addObject:t];
     }
     _tracks = tracks;
-    for (SubtitleTrack *t in tracks) if (t.forced) { _defaultTrack = t; break; }
     if (_fmt) {
         _thread = [[NSThread alloc] initWithTarget:self selector:@selector(run) object:nil];
         _thread.name = @"subtitles";
         [_thread start];
     }
     return self;
+}
+
+- (SubtitleTrack *)autoTrackForAudioLanguage:(NSString *)audioLanguage {
+    NSMutableArray<NSString *> *mine = [NSMutableArray array];
+    for (NSString *p in NSLocale.preferredLanguages) { NSString *c = langCode(p); if (c && ![mine containsObject:c]) [mine addObject:c]; }
+    NSString *audio = langCode(audioLanguage);
+    if (audio && ![mine containsObject:audio]) {
+        // Foreign-language audio: full subtitles in my language (prefer non-SDH).
+        for (NSString *L in mine) {
+            for (SubtitleTrack *t in _tracks) if ([t.language isEqualToString:L] && !t.forced && !t.sdh) return t;
+            for (SubtitleTrack *t in _tracks) if ([t.language isEqualToString:L] && !t.forced) return t;
+        }
+        return nil;
+    }
+    // Audio in my language (or unknown): only forced lines, in my language or untagged.
+    for (NSString *L in mine)
+        for (SubtitleTrack *t in _tracks) if (t.forced && [t.language isEqualToString:L]) return t;
+    for (SubtitleTrack *t in _tracks) if (t.forced && !t.language) return t;
+    return nil;
 }
 
 - (void)stop { [_lock lock]; _stop = YES; [_lock unlock]; }

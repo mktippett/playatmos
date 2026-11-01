@@ -12,6 +12,7 @@ NS_ASSUME_NONNULL_BEGIN
 @interface SubtitleTrack : NSObject
 @property (readonly) NSString *label;     // menu title
 @property (readonly) BOOL forced;
+@property (readonly, nullable) NSString *language;   // ISO 639-1, e.g. "en"
 @end
 
 @interface SubtitleCue : NSObject
@@ -25,8 +26,10 @@ NS_ASSUME_NONNULL_BEGIN
 @interface Subtitles : NSObject
 - (instancetype)initWithPath:(NSString *)videoPath;
 @property (readonly) NSArray<SubtitleTrack *> *tracks;
-/// Track to show by default: the first forced track, else nil (off).
-@property (readonly, nullable) SubtitleTrack *defaultTrack;
+/// Automatic choice, like the Apple TV app's "Auto": if the audio is in a language
+/// you don't use (per System Settings' preferred languages), a full track in your
+/// language; otherwise only a forced track in your language; otherwise nil (off).
+- (nullable SubtitleTrack *)autoTrackForAudioLanguage:(nullable NSString *)audioLanguage;
 @property (readonly, nullable) SubtitleTrack *selectedTrack;
 - (void)selectTrack:(nullable SubtitleTrack *)track;
 /// Cues active at time t (seconds).  Also tells the reader where the playhead is.
