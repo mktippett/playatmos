@@ -60,29 +60,56 @@ static void sendAll(int fd, const void *buf, size_t len) {
     while (len) { ssize_t n = write(fd, p, len); if (n <= 0) return; p += n; len -= (size_t)n; }
 }
 
+// Parse a single-range "Range: bytes=..." value against a body of length len.
+// Returns 1 with [*from, *to] (inclusive) for a satisfiable range, 0 to ignore the header
+// (absent, malformed or multi-range: serve the whole body), -1 for an unsatisfiable range (416).
+static int parseRange(NSString *spec, long long len, long long *from, long long *to) {
+    if (!spec || [spec containsString:@","]) return 0;
+    NSArray *p = [spec componentsSeparatedByString:@"-"];
+    if (p.count != 2) return 0;
+    NSString *a = [p[0] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    NSString *b = [p[1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    if (!a.length && !b.length) return 0;
+    if (!a.length) {                                   // suffix: the last N bytes
+        long long n = b.longLongValue;
+        if (n <= 0 || len == 0) return -1;
+        *from = n >= len ? 0 : len - n; *to = len - 1; return 1;
+    }
+    long long f = a.longLongValue, t = b.length ? b.longLongValue : len - 1;
+    if (f < 0 || f >= len || t < f) return -1;
+    *from = f; *to = MIN(t, len - 1); return 1;
+}
+
 - (void)handle:(int)c {
+    // A client that goes quiet (or stops reading) releases its thread after a minute instead
+    // of holding it, and this server and its Segmenter, forever.
+    struct timeval tv = { .tv_sec = 60 };
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    char buf[8192]; size_t got = 0;
     // Serve requests on this connection until the client closes (keep-alive).
     for (;;) {
-        char buf[8192]; size_t got = 0;
-        while (got < sizeof buf - 1) {
+        char *endp;
+        while (!(buf[got] = 0, endp = strstr(buf, "\r\n\r\n"))) {
+            if (got >= sizeof buf - 1) { close(c); return; }   // header too large
             ssize_t n = read(c, buf + got, sizeof buf - 1 - got);
             if (n <= 0) { close(c); return; }
-            got += (size_t)n; buf[got] = 0;
-            if (strstr(buf, "\r\n\r\n")) break;
+            got += (size_t)n;
         }
-        NSString *req = [[NSString alloc] initWithBytes:buf length:got encoding:NSISOLatin1StringEncoding];
+        size_t hlen = (size_t)(endp - buf) + 4;
+        NSString *req = [[NSString alloc] initWithBytes:buf length:hlen encoding:NSISOLatin1StringEncoding];
+        // Keep anything after this request's headers (a pipelined request) for the next pass.
+        memmove(buf, buf + hlen, got - hlen); got -= hlen;
+
         NSArray *lines = [req componentsSeparatedByString:@"\r\n"];
         NSArray *rl = [lines.firstObject componentsSeparatedByString:@" "];
         if (rl.count < 2) { close(c); return; }
-        NSString *method = rl[0], *path = rl[1];
-        long long r0 = -1, r1 = -1;
-        for (NSString *h in lines) {
-            if ([h.lowercaseString hasPrefix:@"range: bytes="]) {
-                NSArray *p = [[h substringFromIndex:13] componentsSeparatedByString:@"-"];
-                r0 = [p[0] longLongValue];
-                r1 = (p.count > 1 && [p[1] length]) ? [p[1] longLongValue] : -1;
+        NSString *method = rl[0], *path = rl[1], *range = nil;
+        for (NSString *h in lines)
+            if ([h.lowercaseString hasPrefix:@"range:"]) {
+                NSString *v = [[h substringFromIndex:6] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                if ([v.lowercaseString hasPrefix:@"bytes="]) range = [v substringFromIndex:6];
             }
-        }
 
         NSData *body = nil; NSString *type = @"application/octet-stream";
         if ([path isEqualToString:@"/index.m3u8"]) {
@@ -96,14 +123,18 @@ static void sendAll(int fd, const void *buf, size_t len) {
 
         NSString *head;
         NSData *payload = body;
+        long long len = (long long)body.length, r0 = 0, r1 = 0;
+        int rs = body ? parseRange(range, len, &r0, &r1) : 0;
         if (!body) {
             head = @"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n";
             payload = nil;
-        } else if (r0 >= 0 && r0 < (long long)body.length) {
-            long long e = (r1 < 0 || r1 >= (long long)body.length) ? (long long)body.length - 1 : r1;
-            payload = [body subdataWithRange:NSMakeRange((NSUInteger)r0, (NSUInteger)(e - r0 + 1))];
-            head = [NSString stringWithFormat:@"HTTP/1.1 206 Partial Content\r\nContent-Type: %@\r\nContent-Length: %lu\r\nContent-Range: bytes %lld-%lld/%lu\r\nAccept-Ranges: bytes\r\n",
-                    type, (unsigned long)payload.length, r0, e, (unsigned long)body.length];
+        } else if (rs < 0) {
+            head = [NSString stringWithFormat:@"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */%lld\r\nContent-Length: 0\r\n", len];
+            payload = nil;
+        } else if (rs > 0) {
+            payload = [body subdataWithRange:NSMakeRange((NSUInteger)r0, (NSUInteger)(r1 - r0 + 1))];
+            head = [NSString stringWithFormat:@"HTTP/1.1 206 Partial Content\r\nContent-Type: %@\r\nContent-Length: %lu\r\nContent-Range: bytes %lld-%lld/%lld\r\nAccept-Ranges: bytes\r\n",
+                    type, (unsigned long)payload.length, r0, r1, len];
         } else {
             head = [NSString stringWithFormat:@"HTTP/1.1 200 OK\r\nContent-Type: %@\r\nContent-Length: %lu\r\nAccept-Ranges: bytes\r\n",
                     type, (unsigned long)body.length];

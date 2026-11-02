@@ -43,6 +43,9 @@
     NSString *_deviceUID;       // nil = follow system default output
     NSMenu *_outputMenu;
     NSURL *_pendingOpen;
+    NSURL *_url;                // file being played (stress-test hook reopens it)
+    int _stressLeft;            // PLAYATMOS_STRESS steps remaining
+    BOOL _stressStarted;
     Subtitles *_subs;
     SubtitleView *_subView;
     NSMenu *_subMenu;
@@ -227,6 +230,7 @@ static NSMenuItem *item(NSString *t, SEL a, NSString *k) { return [[NSMenuItem a
     [_server stop]; _server = nil; _seg = nil;
     [_subs stop]; _subs = nil;
     _subView.cues = @[]; [_subView setNeedsDisplay:YES];
+    _url = url;
     _win.title = url.lastPathComponent;
     _win.subtitle = @"Opening…";
     NSString *path = url.path;
@@ -307,6 +311,8 @@ static NSMenuItem *item(NSString *t, SEL a, NSString *k) { return [[NSMenuItem a
     // Test hooks (automated checks without screen recording):
     //   PLAYATMOS_SEEK=<sec>      start playback there
     //   PLAYATMOS_SNAPSHOT=<png>  3 s after start, render the subtitle overlay to a PNG
+    //   PLAYATMOS_STRESS=<n>      n steps 0.7 s apart (random seeks, skips, subtitle-track
+    //                             switches, one reopen halfway), then quit: for sanitizer runs
     const char *seek = getenv("PLAYATMOS_SEEK"), *snap = getenv("PLAYATMOS_SNAPSHOT");
     if (seek) [_player seekToTime:CMTimeMakeWithSeconds(atof(seek), 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
     if (snap) {
@@ -325,6 +331,38 @@ static NSMenuItem *item(NSString *t, SEL a, NSString *k) { return [[NSMenuItem a
         });
     }
     [_player play];
+    if (!_stressStarted && getenv("PLAYATMOS_STRESS")) {
+        _stressStarted = YES;
+        _stressLeft = atoi(getenv("PLAYATMOS_STRESS"));
+        [self stressStep:_stressLeft];
+    }
+}
+
+- (void)stressStep:(int)total {
+    if (_stressLeft-- <= 0) {
+        os_log(OS_LOG_DEFAULT, "PlayAtmos: stress done");
+        [NSApp terminate:nil];
+        return;
+    }
+    int step = total - _stressLeft;
+    if (step == total / 2) {
+        [self openURL:_url];   // tear down server/segmenter/subtitles mid-playback and start again
+    } else if (_player && _seg) {
+        switch (arc4random_uniform(4)) {
+            case 0: [self skipBy:arc4random_uniform(2) ? 10 : -10]; break;
+            case 1: {
+                NSArray *tr = _subs.tracks;
+                NSUInteger k = arc4random_uniform((uint32_t)tr.count + 1);
+                [_subs selectTrack:k < tr.count ? tr[k] : nil];
+                break;
+            }
+            default: {
+                double t = arc4random_uniform(1000) / 1000.0 * MAX(_seg.duration - 10, 1);
+                [_player seekToTime:CMTimeMakeWithSeconds(t, 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+            }
+        }
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 700 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [self stressStep:total]; });
 }
 @end
 

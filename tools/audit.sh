@@ -8,6 +8,9 @@
 #                                    per kind, default 4) run through the sanitizer build
 #   tools/audit.sh library [dir]     sanitizer `check` over every video file in dir
 #                                    (default /Volumes/Movies); read-only and silent
+#   tools/audit.sh tsan [N] [file…]  Thread Sanitizer build of the app; plays each file (default: the
+#                                    reference files) with PLAYATMOS_STRESS=N (default 40) at 3% volume
+#                                    on the current output device; reports races per source location
 #
 # Results: a summary on stdout; full logs under build/audit/<step>/.
 # A file counts as CRASH if it died on a signal, hit an ASan/UBSan report or timed out;
@@ -164,10 +167,48 @@ step_library() {
     echo "full results: $d/results.tsv; crash logs: $d/logs/"
 }
 
+step_tsan() {
+    local n=${1:-40}; shift || true
+    local files=("$@"); [ ${#files[@]} -gt 0 ] || files=("${REFS[@]}")
+    local d=$OUT/tsan app=$OUT/PlayAtmos-tsan.app; rm -rf $d; mkdir -p $d
+    if [ ! -x $app/Contents/MacOS/PlayAtmos ] || [ -n "$(find src Info.plist -newer $app/Contents/MacOS/PlayAtmos)" ]; then
+        echo "building $app"
+        rm -rf $app; mkdir -p $app/Contents/MacOS
+        clang "${CF[@]}" -O1 -g -fno-omit-frame-pointer -fsanitize=thread src/main.m "${SRC[@]}" "${FFI[@]}" "${FFL[@]}" \
+            -framework Cocoa -framework AVKit -framework AVFoundation -framework CoreMedia -framework CoreAudio \
+            -o $app/Contents/MacOS/PlayAtmos || exit 1
+        cp Info.plist $app/Contents/Info.plist
+        codesign --force -s - $app >/dev/null 2>&1 || true
+    fi
+    if pgrep -xq PlayAtmos; then echo "PlayAtmos is already running; quit it first"; exit 1; fi
+    local abs; abs="$(pwd)/$d"
+    for f in "${files[@]}"; do
+        [ -f "$f" ] || { echo "missing: $f"; continue; }
+        local tag; tag=$(basename "$f" | tr -cd 'A-Za-z0-9' | cut -c1-24)
+        mkdir -p "$d/$tag"
+        echo "== tsan: $(basename "$f")  ($n stress steps)"
+        local t0; t0=$(date +%s)
+        with_timeout open -n -W -a "$(pwd)/$app" \
+            --env TSAN_OPTIONS="log_path=$abs/$tag/report:halt_on_error=0:second_deadlock_stack=1" \
+            --env PLAYATMOS_VOLUME=0.03 --env PLAYATMOS_STRESS="$n" "$f"
+        local rc=$?
+        echo "  exit $rc after $(( $(date +%s) - t0 ))s; $(cat "$d/$tag"/report.* 2>/dev/null | grep -c 'WARNING: ThreadSanitizer') reports"
+    done
+    # One line per distinct report: kind, then the first frame in our own code (or "system only").
+    cat "$d"/*/report.* 2>/dev/null | awk '
+        /WARNING: ThreadSanitizer:/ { if (kind) print kind "\t" (loc ? loc : "system only"); sub(/.*ThreadSanitizer: /, ""); sub(/ \(pid=.*/, ""); kind = $0; loc = ""; next }
+        kind && !loc && /\/(src|tools)\/[A-Za-z]+\.(m|h):[0-9]+/ { match($0, /(src|tools)\/[A-Za-z]+\.(m|h):[0-9]+/); loc = substr($0, RSTART, RLENGTH) }
+        END { if (kind) print kind "\t" (loc ? loc : "system only") }' | sort | uniq -c | sort -rn > $d/summary.txt
+    echo "distinct races (count, kind, first frame in our code):"
+    sed 's/^/  /' $d/summary.txt
+    echo "full reports: $d/<file>/report.*"
+}
+
 case "${1:-}" in
     static)   step_static ;;
     sanitize) step_sanitize ;;
     fuzz)     step_fuzz "${2:-4}" ;;
     library)  step_library "${2:-}" ;;
-    *) sed -n '2,15p' "$0"; exit 2 ;;
+    tsan)     shift; step_tsan "$@" ;;
+    *) sed -n '2,18p' "$0"; exit 2 ;;
 esac
