@@ -178,7 +178,8 @@ per-channel RMS:
 - `src/Subtitles.[hm]`: subtitle reader/decoder and the overlay view
 - `src/main.m`: AppKit app (AVPlayerView, menus, drag and drop, output device and subtitle menus).
   Test hooks: `PLAYATMOS_VOLUME`, `PLAYATMOS_SEEK=<sec>`, `PLAYATMOS_SNAPSHOT=<png>`
-  (renders the subtitle overlay 3 s after start)
+  (renders the subtitle overlay 3 s after start), `PLAYATMOS_STRESS=<n>` (n random
+  seeks/skips/subtitle switches and one reopen, then quit)
 - `tools/atmostest.m`: `dump` segments to disk, or `play` through AVPlayer and capture
   per-channel RMS (`CAP_SERIES=1` for a 1 s time series). Pass your device UID as the
   6th argument.
@@ -186,6 +187,11 @@ per-channel RMS:
   render the overlay to a PNG
 - `tools/capture.m`: capture-only meter for testing the app itself
   (`open --env PLAYATMOS_VOLUME=0.03 -a build/PlayAtmos.app file.mkv`, then `build/capture 8`)
+- `tools/audit.sh`: checks kept out of the normal build: `static` (clang analyzer and
+  extra warnings), `sanitize` and `fuzz` (ASan/UBSan on test files and corrupted copies),
+  `library <dir>` (sanitizer check over a media folder), `tsan` (Thread Sanitizer build of
+  the app driven by `PLAYATMOS_STRESS`)
+- `tools/makeicon.m`: draws the app icon; `build.sh` turns it into `AppIcon.icns`
 - `probe/`: the investigation programs behind the table above
 
 The code is Objective-C built with plain clang (no Xcode project). Most of it works
